@@ -82,3 +82,37 @@ func TestBuildRoutingTable_ResourcePrefixSkipConditions(t *testing.T) {
 	_, ok = table.LookupResourcePrefix("unsup_template.html")
 	assert.False(t, ok, "server that doesn't support resources must not be resource-routable")
 }
+
+// TestBuildRoutingTable_CopiesGuardrailsConfigIDs verifies the broker wiring: a
+// registered server's per-server guardrails config IDs must survive onto
+// the routing.ServerRoute the router looks up, since that's how the
+// request-side check learns which configIDs to send to the guardrails
+// server for this tool's server.
+func TestBuildRoutingTable_CopiesGuardrailsConfigIDs(t *testing.T) {
+	b := &mcpBrokerImpl{
+		logger: slog.Default(),
+		mcpServers: map[config.UpstreamMCPID]upstream.ActiveMCPServer{
+			"guarded": &resourceCapableMockServer{cfg: config.MCPServer{
+				Name:                "guarded",
+				Prefix:              "guarded_",
+				UserSpecificList:    true,
+				GuardrailsConfigIDs: []string{"config-a", "config-b"},
+			}},
+			"unguarded": &resourceCapableMockServer{cfg: config.MCPServer{
+				Name:             "unguarded",
+				Prefix:           "unguarded_",
+				UserSpecificList: true,
+			}},
+		},
+	}
+
+	table := b.buildRoutingTable()
+
+	route, ok := table.LookupPrefix("guarded_")
+	assert.True(t, ok)
+	assert.Equal(t, []string{"config-a", "config-b"}, route.GuardrailsConfigIDs)
+
+	route, ok = table.LookupPrefix("unguarded_")
+	assert.True(t, ok)
+	assert.Empty(t, route.GuardrailsConfigIDs)
+}

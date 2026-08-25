@@ -20,6 +20,7 @@ import (
 	"github.com/Kuadrant/mcp-gateway/internal/clients"
 	"github.com/Kuadrant/mcp-gateway/internal/config"
 	"github.com/Kuadrant/mcp-gateway/internal/elicitation"
+	"github.com/Kuadrant/mcp-gateway/internal/guardrails"
 	"github.com/Kuadrant/mcp-gateway/internal/idmap"
 	"github.com/Kuadrant/mcp-gateway/internal/session"
 	"github.com/Kuadrant/mcp-gateway/internal/transport"
@@ -1028,6 +1029,71 @@ func TestHandleElicitationResponse_ViaRouteRequest(t *testing.T) {
 	err := json.Unmarshal(decision.BodyMutation, &restored)
 	require.NoError(t, err)
 	require.Equal(t, float64(99), restored.ID)
+}
+
+func TestHandleElicitationResponse_Guardrails(t *testing.T) {
+	newGuardedElicitation := func(t *testing.T, fc *fakeChecker, serverConfigIDs, globalConfigIDs []string) (*Router202511, string) {
+		t.Helper()
+		serverConfigs := []*config.MCPServer{
+			{
+				Name:                "weather-server",
+				URL:                 "http://weather.mcp.local:8080/mcp",
+				Prefix:              "weather_",
+				State:               "Enabled",
+				Hostname:            "weather.mcp.local",
+				GuardrailsConfigIDs: serverConfigIDs,
+			},
+		}
+		router, validToken := newTestRouter(t, serverConfigs, map[string]string{}, map[string]string{})
+		if fc != nil {
+			router.GuardrailsChecker = func() guardrails.Checker { return fc }
+		}
+		router.RoutingConfig.Store(&config.MCPServersConfig{
+			Servers:          serverConfigs,
+			GlobalGuardrails: &config.GuardrailsConfig{ConfigIDs: globalConfigIDs},
+		})
+		return router, validToken
+	}
+
+	t.Run("accept is checked; blocked does not reach upstream", func(t *testing.T) {
+		fc := &fakeChecker{decision: &guardrails.Decision{Status: guardrails.StatusBlocked, Reason: "unsafe"}}
+		router, validToken := newGuardedElicitation(t, fc, []string{"svr-1"}, nil)
+		gatewayID := mustStoreIDMap(t, router.ElicitationMap, float64(42), "weather-server", "backend-session-abc", validToken)
+		decision := router.RouteRequest(context.Background(), &Request{Parsed: &MCPRequest{
+			ID:      gatewayID,
+			JSONRPC: "2.0",
+			Result:  map[string]any{"action": "accept", "content": map[string]any{"name": "test"}},
+			Headers: map[string]string{"mcp-session-id": validToken},
+		}})
+		require.NotNil(t, decision.Error)
+		require.Equal(t, 403, decision.Error.StatusCode)
+		require.Empty(t, decision.Authority)
+		require.Equal(t, 1, fc.calls)
+		require.Equal(t, "accept", fc.lastToolName)
+		require.Empty(t, fc.lastMessageConfig)
+		require.JSONEq(t, `{"content":{"name":"test"}}`, string(fc.lastArguments))
+		require.Contains(t, decision.Error.JSONRPCErr, "event: message")
+		require.Contains(t, decision.Error.JSONRPCErr, `"error"`)
+		require.Equal(t, validToken, decision.SetHeaders[SessionHeader])
+		_, found, err := router.ElicitationMap.Lookup(context.Background(), gatewayID)
+		require.NoError(t, err)
+		require.True(t, found, "blocked accept must not consume the elicitation ID")
+	})
+
+	t.Run("decline bypasses the check", func(t *testing.T) {
+		fc := &fakeChecker{decision: &guardrails.Decision{Status: guardrails.StatusBlocked}}
+		router, validToken := newGuardedElicitation(t, fc, []string{"svr-1"}, nil)
+		gatewayID := mustStoreIDMap(t, router.ElicitationMap, float64(42), "weather-server", "backend-session-abc", validToken)
+		decision := router.RouteRequest(context.Background(), &Request{Parsed: &MCPRequest{
+			ID:      gatewayID,
+			JSONRPC: "2.0",
+			Result:  map[string]any{"action": "decline"},
+			Headers: map[string]string{"mcp-session-id": validToken},
+		}})
+		require.Nil(t, decision.Error)
+		require.Equal(t, "weather.mcp.local", decision.Authority)
+		require.Equal(t, 0, fc.calls)
+	})
 }
 
 func mustNewIDMap(t *testing.T) idmap.Map {
@@ -2266,6 +2332,24 @@ func TestBuildSSEToolError(t *testing.T) {
 	require.Equal(t, "something went wrong", envelope.Result.Content[0].Text)
 }
 
+func TestBuildSSEJSONRPCError(t *testing.T) {
+	result := BuildSSEJSONRPCError("req-1", "blocked by guardrails")
+	var envelope struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      string `json:"id"`
+		Error   struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	data := extractSSEData(t, result)
+	require.NoError(t, json.Unmarshal([]byte(data), &envelope))
+	require.Equal(t, "2.0", envelope.JSONRPC)
+	require.Equal(t, "req-1", envelope.ID)
+	require.Equal(t, -32000, envelope.Error.Code)
+	require.Equal(t, "blocked by guardrails", envelope.Error.Message)
+}
+
 func extractSSEData(t *testing.T, sse string) string {
 	t.Helper()
 	const prefix = "data: "
@@ -2277,6 +2361,129 @@ func extractSSEData(t *testing.T, sse string) string {
 		return rest
 	}
 	return rest[:end]
+}
+
+// TestRouteToolCall_Guardrails covers the F3 request-side guardrails
+// integration end-to-end through Router202511.RouteRequest: allow, block,
+// failMode deny/allow fallbacks, and the two ways a check is skipped
+// (no Checker configured, merged config IDs empty).
+func TestRouteToolCall_Guardrails(t *testing.T) {
+	newGuardedRouter := func(t *testing.T, fc *fakeChecker, serverConfigIDs []string, globalConfigIDs []string) (*Router202511, string) {
+		t.Helper()
+		serverConfigs := []*config.MCPServer{
+			{
+				Name:                "dummy",
+				URL:                 "http://localhost:8080/mcp",
+				Prefix:              "s_",
+				State:               "Enabled",
+				Hostname:            "localhost",
+				GuardrailsConfigIDs: serverConfigIDs,
+			},
+		}
+		router, validToken := newTestRouterWithSession(t, serverConfigs, "dummy")
+		router.Table = func() RoutingTable {
+			return NewTableBuilder().
+				AddTool("s_mytool", &ServerRoute{
+					Name:                "dummy",
+					Host:                "localhost",
+					Prefix:              "s_",
+					Path:                "/mcp",
+					URL:                 "http://localhost:8080/mcp",
+					GuardrailsConfigIDs: serverConfigIDs,
+				}).
+				Build()
+		}
+		if fc != nil {
+			router.GuardrailsChecker = func() guardrails.Checker { return fc }
+		}
+		router.RoutingConfig.Store(&config.MCPServersConfig{
+			Servers:          serverConfigs,
+			GlobalGuardrails: &config.GuardrailsConfig{ConfigIDs: globalConfigIDs},
+		})
+		return router, validToken
+	}
+
+	toolCallReq := func(token string) *Request {
+		return &Request{Parsed: &MCPRequest{
+			ID:      ptr.To(0),
+			JSONRPC: "2.0",
+			Method:  "tools/call",
+			Params:  map[string]any{"name": "s_mytool", "arguments": map[string]any{"x": 1}},
+			Headers: map[string]string{"mcp-session-id": token},
+		}}
+	}
+
+	t.Run("no checker with config IDs fail closed", func(t *testing.T) {
+		router, token := newGuardedRouter(t, nil, []string{"svr-1"}, nil)
+		decision := router.RouteRequest(context.Background(), toolCallReq(token))
+		require.NotNil(t, decision.Error)
+		require.Equal(t, 503, decision.Error.StatusCode)
+		require.Contains(t, decision.Error.JSONRPCErr, guardrailsUnavailableMessage)
+		require.Equal(t, token, decision.SetHeaders[SessionHeader])
+	})
+
+	t.Run("checker configured but merged config IDs empty skips check", func(t *testing.T) {
+		fc := &fakeChecker{decision: &guardrails.Decision{Status: guardrails.StatusBlocked}}
+		router, token := newGuardedRouter(t, fc, nil, nil)
+		decision := router.RouteRequest(context.Background(), toolCallReq(token))
+		require.Nil(t, decision.Error)
+		require.Equal(t, 0, fc.calls, "checker must not be called when merged config IDs are empty")
+	})
+
+	t.Run("allowed routes to upstream", func(t *testing.T) {
+		fc := &fakeChecker{decision: &guardrails.Decision{Status: guardrails.StatusAllowed}}
+		router, token := newGuardedRouter(t, fc, []string{"svr-1"}, []string{"global-1"})
+		decision := router.RouteRequest(context.Background(), toolCallReq(token))
+		require.Nil(t, decision.Error)
+		require.Equal(t, "localhost", decision.Authority)
+		require.Equal(t, 1, fc.calls)
+		require.Equal(t, []string{"svr-1"}, fc.lastConfigIDs)
+		require.Equal(t, "mytool", fc.lastToolName)
+	})
+
+	t.Run("blocked returns 403 JSON-RPC error, never reaches upstream", func(t *testing.T) {
+		fc := &fakeChecker{decision: &guardrails.Decision{Status: guardrails.StatusBlocked, Reason: "unsafe"}}
+		router, token := newGuardedRouter(t, fc, []string{"svr-1"}, nil)
+		decision := router.RouteRequest(context.Background(), toolCallReq(token))
+		require.NotNil(t, decision.Error)
+		require.Equal(t, 403, decision.Error.StatusCode)
+		require.Contains(t, decision.Error.JSONRPCErr, "unsafe")
+		require.Empty(t, decision.Authority, "blocked call must not carry a routing decision")
+	})
+
+	t.Run("failMode deny fallback returns 503 JSON-RPC", func(t *testing.T) {
+		fc := &fakeChecker{decision: &guardrails.Decision{Status: guardrails.StatusBlocked, Err: fmt.Errorf("transport error")}}
+		router, token := newGuardedRouter(t, fc, []string{"svr-1"}, nil)
+		decision := router.RouteRequest(context.Background(), toolCallReq(token))
+		require.NotNil(t, decision.Error)
+		require.Equal(t, 503, decision.Error.StatusCode)
+		require.Contains(t, decision.Error.JSONRPCErr, guardrailsUnavailableMessage)
+	})
+
+	t.Run("failMode allow fallback routes to upstream", func(t *testing.T) {
+		fc := &fakeChecker{decision: &guardrails.Decision{Status: guardrails.StatusAllowed, Err: fmt.Errorf("transport error")}}
+		router, token := newGuardedRouter(t, fc, []string{"svr-1"}, nil)
+		decision := router.RouteRequest(context.Background(), toolCallReq(token))
+		require.Nil(t, decision.Error)
+		require.Equal(t, "localhost", decision.Authority)
+	})
+}
+
+// TestRouteToMCPServer_CopiesGuardrailsConfigIDs verifies the router wiring: a
+// ServerRoute's per-server guardrails config IDs must survive the conversion
+// to config.MCPServer, since that's how both protocol routers learn which
+// configIDs to pass to Checker.CheckRequest.
+func TestRouteToMCPServer_CopiesGuardrailsConfigIDs(t *testing.T) {
+	route := &ServerRoute{
+		Name:                "svr",
+		Host:                "svr.local",
+		Prefix:              "svr_",
+		URL:                 "http://svr.local/mcp",
+		GuardrailsConfigIDs: []string{"config-a", "config-b"},
+	}
+
+	svr := routeToMCPServer(route)
+	require.Equal(t, []string{"config-a", "config-b"}, svr.GuardrailsConfigIDs)
 }
 
 // x-mcp-annotation-hints must render mark3labs semantics: nil pointers as

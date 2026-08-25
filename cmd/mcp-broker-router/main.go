@@ -52,8 +52,7 @@ type commonConfig struct {
 type routerConfig struct {
 	// commonConfig is to be considered immutable
 	commonConfig
-	addr               string
-	maxRequestBodySize int
+	addr string
 }
 
 type brokerConfig struct {
@@ -158,7 +157,6 @@ func parseFlags() *app {
 
 	// router-specific flags
 	flag.StringVar(&rc.addr, "mcp-router-address", "0.0.0.0:50051", "The address for MCP router")
-	flag.IntVar(&rc.maxRequestBodySize, "max-request-body-size", 5242880, "max request body size in bytes for the ext_proc router. Default 5MB.")
 
 	flag.Parse()
 
@@ -428,8 +426,16 @@ func (a *app) loadConfig(path string) error {
 			return fmt.Errorf("rebuilding hairpin client: %w", err)
 		}
 	}
+	var globalGuardrails *config.GuardrailsConfig
+	if viper.IsSet("globalGuardrails") {
+		if err := viper.UnmarshalKey("globalGuardrails", &globalGuardrails); err != nil {
+			return fmt.Errorf("decoding globalGuardrails config: %w", err)
+		}
+	}
 	a.mcpConfig.SetServers(newServers, newVirtualServers)
 	a.mcpConfig.SetGatewayCACertPEM(gatewayCACertPEM)
+	a.mcpConfig.SetGlobalGuardrails(globalGuardrails)
+	a.mcpConfig.SetMaxBodyBytes(viper.GetInt64("maxBodyBytes"))
 
 	a.logger.Debug("config successfully loaded", "# servers", len(newServers))
 

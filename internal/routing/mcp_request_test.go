@@ -1,6 +1,77 @@
 package routing
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestMCPRequest_Arguments(t *testing.T) {
+	t.Run("marshals arguments to raw JSON", func(t *testing.T) {
+		req := &MCPRequest{Params: map[string]any{"name": "tool", "arguments": map[string]any{"key": "value"}}}
+		raw, err := req.Arguments()
+		require.NoError(t, err)
+		require.JSONEq(t, `{"key":"value"}`, string(raw))
+	})
+
+	t.Run("no arguments key returns nil", func(t *testing.T) {
+		req := &MCPRequest{Params: map[string]any{"name": "tool"}}
+		raw, err := req.Arguments()
+		require.NoError(t, err)
+		require.Nil(t, raw)
+	})
+
+	t.Run("nil arguments value returns nil", func(t *testing.T) {
+		req := &MCPRequest{Params: map[string]any{"name": "tool", "arguments": nil}}
+		raw, err := req.Arguments()
+		require.NoError(t, err)
+		require.Nil(t, raw)
+	})
+
+	t.Run("nil params returns nil", func(t *testing.T) {
+		req := &MCPRequest{}
+		raw, err := req.Arguments()
+		require.NoError(t, err)
+		require.Nil(t, raw)
+	})
+
+	t.Run("unmarshalable arguments returns error", func(t *testing.T) {
+		req := &MCPRequest{Params: map[string]any{"name": "tool", "arguments": make(chan int)}}
+		raw, err := req.Arguments()
+		require.Error(t, err)
+		require.Nil(t, raw)
+	})
+}
+
+func TestMCPRequest_ElicitationArguments(t *testing.T) {
+	t.Run("strips action and keeps the rest", func(t *testing.T) {
+		req := &MCPRequest{Result: map[string]any{"action": "accept", "content": map[string]any{"name": "test"}}}
+		raw, err := req.ElicitationArguments()
+		require.NoError(t, err)
+		require.JSONEq(t, `{"content":{"name":"test"}}`, string(raw))
+	})
+
+	t.Run("action only yields empty object", func(t *testing.T) {
+		req := &MCPRequest{Result: map[string]any{"action": "accept"}}
+		raw, err := req.ElicitationArguments()
+		require.NoError(t, err)
+		require.JSONEq(t, `{}`, string(raw))
+	})
+
+	t.Run("nil result yields empty object", func(t *testing.T) {
+		req := &MCPRequest{}
+		raw, err := req.ElicitationArguments()
+		require.NoError(t, err)
+		require.JSONEq(t, `{}`, string(raw))
+	})
+}
+
+func TestMCPRequest_IsElicitationAccept(t *testing.T) {
+	require.True(t, (&MCPRequest{Result: map[string]any{"action": "accept"}}).IsElicitationAccept())
+	require.False(t, (&MCPRequest{Result: map[string]any{"action": "decline"}}).IsElicitationAccept())
+	require.False(t, (&MCPRequest{Result: map[string]any{"action": "cancel"}}).IsElicitationAccept())
+	require.False(t, (&MCPRequest{Method: "tools/call"}).IsElicitationAccept())
+}
 
 func TestInjectResourcePrefix(t *testing.T) {
 	tests := []struct {

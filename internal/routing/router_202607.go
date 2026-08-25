@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 
 	"github.com/Kuadrant/mcp-gateway/internal/config"
+	"github.com/Kuadrant/mcp-gateway/internal/guardrails"
 	"github.com/Kuadrant/mcp-gateway/internal/protocol"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -16,9 +17,10 @@ import (
 
 // Router202607 implements Router for the 2026-07-28 protocol (stateless, header-based routing).
 type Router202607 struct {
-	Table         RoutingTableFunc
-	RoutingConfig *atomic.Pointer[config.MCPServersConfig]
-	Logger        *slog.Logger
+	Table             RoutingTableFunc
+	RoutingConfig     *atomic.Pointer[config.MCPServersConfig]
+	Logger            *slog.Logger
+	GuardrailsChecker GuardrailsCheckerFunc
 }
 
 var _ Router = &Router202607{}
@@ -129,6 +131,22 @@ func (r *Router202607) routeToolCall(ctx context.Context, table RoutingTable, re
 	if routerErr != nil {
 		return &Decision{Error: routerErr}
 	}
+
+	var requestID any
+	if req.Parsed != nil {
+		requestID = req.Parsed.ID
+	}
+	args, blocked := guardrailsArguments(req.Parsed, requestID, BuildJSONToolError, "application/json")
+	if blocked != nil {
+		return blocked
+	}
+	if blocked := checkGuardrailsRequest(
+		ctx, span, r.GuardrailsChecker, r.RoutingConfig.Load().GetGlobalGuardrails(), serverInfo.GuardrailsConfigIDs,
+		upstreamToolName, args, requestID, BuildJSONToolError, "application/json", guardrails.MessageConfigTool,
+	); blocked != nil {
+		return blocked
+	}
+
 	if bodyMutation != nil {
 		headers["content-length"] = fmt.Sprintf("%d", len(bodyMutation))
 	}

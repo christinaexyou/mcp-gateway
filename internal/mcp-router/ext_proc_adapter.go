@@ -3,6 +3,8 @@ package mcprouter
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -12,6 +14,7 @@ import (
 	"sync/atomic"
 
 	"github.com/Kuadrant/mcp-gateway/internal/config"
+	"github.com/Kuadrant/mcp-gateway/internal/guardrails"
 	"github.com/Kuadrant/mcp-gateway/internal/headers"
 	"github.com/Kuadrant/mcp-gateway/internal/idmap"
 	internaljwt "github.com/Kuadrant/mcp-gateway/internal/jwt"
@@ -33,7 +36,6 @@ type ExtProcServer struct {
 	Logger              *slog.Logger
 	SessionCache        routing.SessionCache
 	ElicitationMap      idmap.Map
-	MaxRequestBodySize  int
 	Router              routing.Router
 	ResponseHandler     routing.ResponseHandler
 	Router202607        routing.Router
@@ -42,11 +44,53 @@ type ExtProcServer struct {
 	// protocol metadata lifted into headers for Telemetry and AuthPolicy. Off by
 	// default; no A2A code path runs unless it is set.
 	EnableA2A bool
+	// GuardrailsChecker is rebuilt on every config change from GlobalGuardrails
+	// + the gateway CA bundle; nil when guardrails is not configured. Shared
+	// with both protocol routers via a func field set at construction time.
+	GuardrailsChecker atomic.Pointer[guardrails.Checker]
 }
 
-// OnConfigChange is used to register the router for config changes
-func (s *ExtProcServer) OnConfigChange(_ context.Context, newConfig *config.MCPServersConfig) {
+// OnConfigChange is used to register the router for config changes, and
+// rebuilds the guardrails Checker when guardrails config changes.
+func (s *ExtProcServer) OnConfigChange(ctx context.Context, newConfig *config.MCPServersConfig) {
 	s.RoutingConfig.Store(newConfig)
+	s.rebuildGuardrailsChecker(ctx, newConfig)
+}
+
+// rebuildGuardrailsChecker recreates the guardrails Checker from the latest
+// GlobalGuardrails config and gateway CA bundle, storing nil when guardrails
+// is not configured. TLS trust mirrors the broker's additive pool: system
+// roots plus the gateway CA bundle (no per-server CA at this layer).
+func (s *ExtProcServer) rebuildGuardrailsChecker(ctx context.Context, newConfig *config.MCPServersConfig) {
+	globalGuardrails := newConfig.GetGlobalGuardrails()
+	if globalGuardrails == nil {
+		if s.GuardrailsChecker.Swap(nil) != nil {
+			s.Logger.InfoContext(ctx, "guardrails checker destroyed")
+		}
+		return
+	}
+
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if caPEM := newConfig.GetGatewayCACertPEM(); caPEM != "" {
+		pool.AppendCertsFromPEM([]byte(caPEM))
+	}
+	tlsConfig := &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+
+	checker := guardrails.NewChecker(globalGuardrails, tlsConfig, 0, newConfig.GetMaxBodyBytes())
+	s.GuardrailsChecker.Store(&checker)
+	s.Logger.InfoContext(ctx, "guardrails checker created")
+}
+
+// requestBodyLimit is the streamed-body accumulation cap. BUFFERED Envoy
+// config delivers one chunk; this exists for streamed bodies.
+func (s *ExtProcServer) requestBodyLimit() int {
+	if cfg := s.RoutingConfig.Load(); cfg != nil {
+		return int(cfg.GetMaxBodyBytes())
+	}
+	return int(config.DefaultMaxBodyBytes)
 }
 
 // HandleRequestHeaders sets the gateway authority and extracts the verified sub claim.
@@ -165,6 +209,7 @@ func (s *ExtProcServer) Process(stream extProcV3.ExternalProcessor_ProcessServer
 		mcpMethodHeader     string
 		mcpNameHeader       string
 		endOfStream         = false
+		requestBodyBuf      []byte // accumulates request body chunks until EndOfStream
 		mcpRequest          *routing.MCPRequest
 		ctx                 = stream.Context()
 		isA2A               = false              // true for /a2a traffic when A2A passthrough is enabled
@@ -308,10 +353,14 @@ func (s *ExtProcServer) Process(stream extProcV3.ExternalProcessor_ProcessServer
 				return err
 			}
 			s.Logger.DebugContext(ctx, "[ext_proc ] Process: ProcessingRequest_RequestBody", "request id:", requestID)
-			body := r.RequestBody.Body
 
-			if s.MaxRequestBodySize > 0 && len(body) > s.MaxRequestBodySize {
-				err := fmt.Errorf("request body too large: %d bytes exceeds limit of %d", len(body), s.MaxRequestBodySize)
+			// accumulate across streamed chunks; only routes once EndOfStream
+			// arrives. Under the current static BUFFERED Envoy config this is a
+			// single iteration (EndOfStream is always true), so this loop is
+			// defensive/forward-compatible rather than reachable today.
+			requestBodyBuf = append(requestBodyBuf, r.RequestBody.Body...)
+			if len(requestBodyBuf) > s.requestBodyLimit() {
+				err := fmt.Errorf("request body too large: exceeds limit of %d bytes", s.requestBodyLimit())
 				s.Logger.ErrorContext(ctx, err.Error(), "request id", requestID)
 				recordError(span, err, 413)
 				resp := responseBuilder.WithImmediateResponse(413, "request body too large").Build()
@@ -322,6 +371,17 @@ func (s *ExtProcServer) Process(stream extProcV3.ExternalProcessor_ProcessServer
 				}
 				return err
 			}
+			if !r.RequestBody.EndOfStream {
+				resp := responseBuilder.WithDoNothingResponse(false).Build()
+				for _, res := range resp {
+					if err := stream.Send(res); err != nil {
+						s.Logger.ErrorContext(ctx, "error sending response", "error", err)
+						return err
+					}
+				}
+				continue
+			}
+			body := requestBodyBuf
 
 			// A2A passthrough: parse the JSON-RPC envelope only and set x-a2a-method
 			// (normalized to a bounded set). An unparseable body fails closed with a

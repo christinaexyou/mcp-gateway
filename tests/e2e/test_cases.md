@@ -425,7 +425,7 @@ When an MCPVirtualServer is configured that includes a specific user-specific to
 
 ### [Full] Large request payload up to 1MB
 
-- When a client sends a tools/call request with a body approaching the default `--max-request-body-size` limit (5MB, test with ~1MB), the gateway should forward the full request to the backend without truncation. The ext_proc body phase must handle the complete payload and the backend should receive and process it successfully.
+- When a client sends a tools/call request with a body approaching the default `maxBodyBytes` limit (1 MiB, test with ~1MB), the gateway should forward the full request to the backend without truncation. The ext_proc body phase must handle the complete payload and the backend should receive and process it successfully.
 
 ## Dual Protocol Gateway
 

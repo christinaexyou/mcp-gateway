@@ -42,6 +42,7 @@ func TestNeMoChecker_CheckRequest(t *testing.T) {
 			msg := messages[0].(map[string]any)
 			require.Equal(t, "user", msg["role"])
 			require.Equal(t, "execute_sql", msg["name"])
+			require.Equal(t, "tool", msg["config"])
 
 			guardrails := body["guardrails"].(map[string]any)
 			require.Equal(t, []any{"global-1", "server-1"}, guardrails["config_ids"])
@@ -50,7 +51,7 @@ func TestNeMoChecker_CheckRequest(t *testing.T) {
 			_, _ = w.Write([]byte(`{"status":"success","content":"ok"}`))
 		}, FailModeDeny)
 
-		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{"query":"SELECT 1"}`), []string{"server-1"})
+		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{"query":"SELECT 1"}`), []string{"server-1"}, MessageConfigTool)
 		require.NoError(t, err)
 		require.Equal(t, &Decision{Status: StatusAllowed, Content: "ok"}, decision)
 	})
@@ -61,7 +62,7 @@ func TestNeMoChecker_CheckRequest(t *testing.T) {
 			_, _ = w.Write([]byte(`{"status":"blocked","content":"denied","rail":"tool-safety-v1"}`))
 		}, FailModeDeny)
 
-		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil)
+		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil, MessageConfigTool)
 		require.NoError(t, err)
 		require.Equal(t, &Decision{Status: StatusBlocked, Content: "denied", Reason: "tool-safety-v1"}, decision)
 	})
@@ -71,7 +72,7 @@ func TestNeMoChecker_CheckRequest(t *testing.T) {
 			t.Fatal("guardrails server should not be called on translation failure")
 		}, FailModeAllow)
 
-		decision, err := checker.CheckRequest(context.Background(), "", json.RawMessage(`{}`), nil)
+		decision, err := checker.CheckRequest(context.Background(), "", json.RawMessage(`{}`), nil, MessageConfigTool)
 		require.Error(t, err)
 		require.Nil(t, decision)
 	})
@@ -81,7 +82,7 @@ func TestNeMoChecker_CheckRequest(t *testing.T) {
 			w.WriteHeader(http.StatusInternalServerError)
 		}, FailModeDeny)
 
-		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil)
+		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil, MessageConfigTool)
 		require.NoError(t, err)
 		require.Equal(t, StatusBlocked, decision.Status)
 		require.Error(t, decision.Err, "a failMode fallback must be distinguishable from a real blocked verdict")
@@ -92,7 +93,7 @@ func TestNeMoChecker_CheckRequest(t *testing.T) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}, FailModeAllow)
 
-		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil)
+		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil, MessageConfigTool)
 		require.NoError(t, err)
 		require.Equal(t, StatusAllowed, decision.Status)
 		require.Error(t, decision.Err)
@@ -104,7 +105,7 @@ func TestNeMoChecker_CheckRequest(t *testing.T) {
 			_, _ = w.Write([]byte(`not json`))
 		}, FailModeDeny)
 
-		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil)
+		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil, MessageConfigTool)
 		require.NoError(t, err)
 		require.Equal(t, StatusBlocked, decision.Status)
 		require.Error(t, decision.Err)
@@ -116,7 +117,7 @@ func TestNeMoChecker_CheckRequest(t *testing.T) {
 			_, _ = w.Write([]byte(`{"status":"success","content":"` + strings.Repeat("a", 32) + `"}`))
 		}, FailModeDeny, 8)
 
-		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil)
+		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil, MessageConfigTool)
 		require.NoError(t, err)
 		require.Equal(t, StatusBlocked, decision.Status)
 		require.Error(t, decision.Err, "a failMode fallback must be distinguishable from a real blocked verdict")
@@ -129,7 +130,7 @@ func TestNeMoChecker_CheckRequest(t *testing.T) {
 			FailMode: FailModeAllow,
 		}, nil, 0, 0)
 
-		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil)
+		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil, MessageConfigTool)
 		require.NoError(t, err)
 		require.Equal(t, StatusAllowed, decision.Status)
 		require.Error(t, decision.Err)
@@ -151,7 +152,7 @@ func TestNeMoChecker_CheckRequest(t *testing.T) {
 					FailMode: tc.failMode,
 				}, nil, 0, 0)
 
-				decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil)
+				decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil, MessageConfigTool)
 				require.NoError(t, err)
 				require.Equal(t, tc.status, decision.Status)
 				require.Equal(t, tc.reason, decision.Reason)
@@ -167,7 +168,7 @@ func TestNeMoChecker_CheckRequest(t *testing.T) {
 			_, _ = w.Write([]byte(`{"status":"blocked","content":"denied","rail":"tool-safety-v1"}`))
 		}, FailModeDeny)
 
-		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil)
+		decision, err := checker.CheckRequest(context.Background(), "execute_sql", json.RawMessage(`{}`), nil, MessageConfigTool)
 		require.NoError(t, err)
 		require.Equal(t, StatusBlocked, decision.Status)
 		require.NoError(t, decision.Err)
@@ -196,16 +197,16 @@ func TestNeMoChecker_CheckResponse(t *testing.T) {
 }
 
 func TestMergeConfigIDs(t *testing.T) {
-	require.Equal(t, []string{"a", "b"}, mergeConfigIDs([]string{"a"}, []string{"b"}))
-	require.Equal(t, []string{"a"}, mergeConfigIDs([]string{"a"}, nil))
-	require.Equal(t, []string{"b"}, mergeConfigIDs(nil, []string{"b"}))
-	require.Nil(t, mergeConfigIDs(nil, nil))
+	require.Equal(t, []string{"a", "b"}, MergeConfigIDs([]string{"a"}, []string{"b"}))
+	require.Equal(t, []string{"a"}, MergeConfigIDs([]string{"a"}, nil))
+	require.Equal(t, []string{"b"}, MergeConfigIDs(nil, []string{"b"}))
+	require.Nil(t, MergeConfigIDs(nil, nil))
 
 	t.Run("deduplicates overlapping global and per-server IDs, keeping global order first", func(t *testing.T) {
-		require.Equal(t, []string{"a", "b", "c"}, mergeConfigIDs([]string{"a", "b"}, []string{"b", "c"}))
+		require.Equal(t, []string{"a", "b", "c"}, MergeConfigIDs([]string{"a", "b"}, []string{"b", "c"}))
 	})
 
 	t.Run("deduplicates within a single side", func(t *testing.T) {
-		require.Equal(t, []string{"a", "b"}, mergeConfigIDs([]string{"a", "a"}, []string{"b", "b"}))
+		require.Equal(t, []string{"a", "b"}, MergeConfigIDs([]string{"a", "a"}, []string{"b", "b"}))
 	})
 }

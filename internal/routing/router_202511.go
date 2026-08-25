@@ -13,6 +13,7 @@ import (
 	"github.com/Kuadrant/mcp-gateway/internal/clients"
 	"github.com/Kuadrant/mcp-gateway/internal/config"
 	"github.com/Kuadrant/mcp-gateway/internal/elicitation"
+	"github.com/Kuadrant/mcp-gateway/internal/guardrails"
 	sharedheaders "github.com/Kuadrant/mcp-gateway/internal/headers"
 	"github.com/Kuadrant/mcp-gateway/internal/idmap"
 	internaljwt "github.com/Kuadrant/mcp-gateway/internal/jwt"
@@ -42,6 +43,7 @@ type Router202511 struct {
 	TokenElicitationMap elicitation.Map
 	ElicitationEnabled  bool
 	Logger              *slog.Logger
+	GuardrailsChecker   GuardrailsCheckerFunc
 	initGroup           singleflight.Group
 }
 
@@ -169,6 +171,19 @@ func (r *Router202511) routeToolCall(ctx context.Context, table RoutingTable, mc
 	headers[ToolHeader] = upstreamToolName
 	mcpReq.ReWriteToolName(upstreamToolName)
 	headers[MCPServerNameHeader] = serverInfo.Name
+
+	args, blocked := guardrailsArguments(mcpReq, mcpReq.ID, BuildSSEToolError, "")
+	if blocked != nil {
+		blocked.SetHeaders = map[string]string{SessionHeader: mcpReq.GetSessionID()}
+		return blocked
+	}
+	if blocked := checkGuardrailsRequest(
+		ctx, span, r.GuardrailsChecker, r.RoutingConfig.Load().GetGlobalGuardrails(), serverInfo.GuardrailsConfigIDs,
+		upstreamToolName, args, mcpReq.ID, BuildSSEToolError, "", guardrails.MessageConfigTool,
+	); blocked != nil {
+		blocked.SetHeaders = map[string]string{SessionHeader: mcpReq.GetSessionID()}
+		return blocked
+	}
 
 	// token resolution for servers with URL elicitation configured
 	if r.ElicitationEnabled && serverInfo.TokenURLElicitation != nil {
@@ -431,6 +446,22 @@ func (r *Router202511) routeElicitationResponse(ctx context.Context, mcpReq *MCP
 		return &Decision{Error: &Error{StatusCode: 500, Message: "internal error"}}
 	}
 
+	if mcpReq.IsElicitationAccept() {
+		args, argErr := mcpReq.ElicitationArguments()
+		if argErr != nil {
+			blocked := jsonRPCErrorDecision(400, mcpReq.ID, fmt.Sprintf("guardrails: %s", argErr.Error()), BuildSSEJSONRPCError, "")
+			blocked.SetHeaders = map[string]string{SessionHeader: mcpReq.GetSessionID()}
+			return blocked
+		}
+		if blocked := checkGuardrailsRequest(
+			ctx, span, r.GuardrailsChecker, r.RoutingConfig.Load().GetGlobalGuardrails(), mcpServerConfig.GuardrailsConfigIDs,
+			elicitationActionAccept, args, mcpReq.ID, BuildSSEJSONRPCError, "", "",
+		); blocked != nil {
+			blocked.SetHeaders = map[string]string{SessionHeader: mcpReq.GetSessionID()}
+			return blocked
+		}
+	}
+
 	body, err := mcpReq.ToBytes()
 	if err != nil {
 		r.Logger.ErrorContext(ctx, "failed to get bytes for elicitation response", "mcpReqID", mcpReq.ID, "serverName", entry.ServerName)
@@ -687,11 +718,12 @@ func (r *Router202511) resolveUpstreamToken(ctx context.Context, mcpReq *MCPRequ
 // compatibility with code that still needs config.MCPServer (e.g. session init).
 func routeToMCPServer(route *ServerRoute) *config.MCPServer {
 	svr := &config.MCPServer{
-		Name:             route.Name,
-		Hostname:         route.Host,
-		Prefix:           route.Prefix,
-		URL:              route.URL,
-		UserSpecificList: route.UserSpecificList,
+		Name:                route.Name,
+		Hostname:            route.Host,
+		Prefix:              route.Prefix,
+		URL:                 route.URL,
+		UserSpecificList:    route.UserSpecificList,
+		GuardrailsConfigIDs: route.GuardrailsConfigIDs,
 	}
 	if route.TokenURLElicitation != nil {
 		svr.TokenURLElicitation = &config.TokenURLElicitationConfig{

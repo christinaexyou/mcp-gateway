@@ -34,11 +34,6 @@ const dialTimeout = 1 * time.Second
 // concurrency hint.
 const defaultMaxIdleConnsPerHost = 100
 
-// defaultMaxBodyBytes bounds the guardrails server's check response when the
-// caller doesn't specify a limit, matching the MCPGatewayExtension
-// maxBodyBytes default (1 MiB).
-const defaultMaxBodyBytes = 1 << 20
-
 // Status is the outcome of a guardrails check.
 type Status string
 
@@ -63,9 +58,13 @@ type Decision struct {
 	Err error
 }
 
+// MessageConfigTool is NeMo messages[0].config for tools/call. Elicitation
+// accept omits the field (empty string).
+const MessageConfigTool = "tool"
+
 // Checker runs guardrails checks against tools/call requests and responses.
 type Checker interface {
-	CheckRequest(ctx context.Context, toolName string, arguments json.RawMessage, configIDs []string) (*Decision, error)
+	CheckRequest(ctx context.Context, name string, arguments json.RawMessage, configIDs []string, messageConfig string) (*Decision, error)
 	CheckResponse(ctx context.Context, toolName string, content []byte, configIDs []string) (*Decision, error)
 }
 
@@ -74,7 +73,7 @@ type Checker interface {
 // Secret type determines which implementation is used; nemoProvider is the
 // only one today.
 type provider interface {
-	TransformRequest(toolName string, arguments json.RawMessage, configIDs []string) ([]byte, error)
+	TransformRequest(name string, arguments json.RawMessage, configIDs []string, messageConfig string) ([]byte, error)
 	TransformResponse(toolName string, content []byte, configIDs []string) ([]byte, error)
 	ParseCheckResponse(body []byte) (status Status, content, reason string, err error)
 }
@@ -116,13 +115,13 @@ type nemoChecker struct {
 
 // NewChecker constructs a Checker for the given resolved guardrails config.
 // maxBodyBytes bounds the guardrails server's check response; non-positive
-// values fall back to defaultMaxBodyBytes.
+// values fall back to config.DefaultMaxBodyBytes.
 func NewChecker(cfg *config.GuardrailsConfig, tlsConfig *tls.Config, maxIdleConnsPerHost int, maxBodyBytes int64) Checker {
 	if maxIdleConnsPerHost <= 0 {
 		maxIdleConnsPerHost = defaultMaxIdleConnsPerHost
 	}
 	if maxBodyBytes <= 0 {
-		maxBodyBytes = defaultMaxBodyBytes
+		maxBodyBytes = config.DefaultMaxBodyBytes
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -145,8 +144,8 @@ func NewChecker(cfg *config.GuardrailsConfig, tlsConfig *tls.Config, maxIdleConn
 // CheckRequest translates and checks a tools/call request. A translation
 // failure is always a hard deny regardless of failMode; a transport failure
 // or an unparseable guardrails response falls back to failMode instead.
-func (c *nemoChecker) CheckRequest(ctx context.Context, toolName string, arguments json.RawMessage, configIDs []string) (*Decision, error) {
-	body, err := c.provider.TransformRequest(toolName, arguments, mergeConfigIDs(c.globalConfigIDs, configIDs))
+func (c *nemoChecker) CheckRequest(ctx context.Context, name string, arguments json.RawMessage, configIDs []string, messageConfig string) (*Decision, error) {
+	body, err := c.provider.TransformRequest(name, arguments, MergeConfigIDs(c.globalConfigIDs, configIDs), messageConfig)
 	if err != nil {
 		return nil, fmt.Errorf("guardrails: request translation failed: %w", err)
 	}
@@ -156,7 +155,7 @@ func (c *nemoChecker) CheckRequest(ctx context.Context, toolName string, argumen
 // CheckResponse translates and checks a tools/call response's text content.
 // Same failure semantics as CheckRequest.
 func (c *nemoChecker) CheckResponse(ctx context.Context, toolName string, content []byte, configIDs []string) (*Decision, error) {
-	body, err := c.provider.TransformResponse(toolName, content, mergeConfigIDs(c.globalConfigIDs, configIDs))
+	body, err := c.provider.TransformResponse(toolName, content, MergeConfigIDs(c.globalConfigIDs, configIDs))
 	if err != nil {
 		return nil, fmt.Errorf("guardrails: response translation failed: %w", err)
 	}
@@ -224,10 +223,10 @@ func (c *nemoChecker) failModeDecision(cause error) *Decision {
 	return &Decision{Status: StatusBlocked, Reason: "guardrails check failed", Err: cause}
 }
 
-// mergeConfigIDs lists global config IDs first, then per-server ones, so
+// MergeConfigIDs lists global config IDs first, then per-server ones, so
 // gateway-wide policies evaluate before server-specific ones, deduplicating
 // any overlap between the two.
-func mergeConfigIDs(global, perServer []string) []string {
+func MergeConfigIDs(global, perServer []string) []string {
 	if len(global) == 0 {
 		return dedup(perServer)
 	}

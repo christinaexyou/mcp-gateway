@@ -2,6 +2,7 @@ package main
 
 import (
 	"github.com/Kuadrant/mcp-gateway/internal/clients"
+	"github.com/Kuadrant/mcp-gateway/internal/guardrails"
 	mcpRouter "github.com/Kuadrant/mcp-gateway/internal/mcp-router"
 	"github.com/Kuadrant/mcp-gateway/internal/routing"
 	extProcV3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
@@ -13,11 +14,10 @@ func (a *app) createRouter() {
 
 	a.grpcServer = grpc.NewServer()
 	a.server = &mcpRouter.ExtProcServer{
-		Logger:             a.logger.With("component", "router"),
-		SessionCache:       a.sessionCache,
-		ElicitationMap:     a.elicitMap,
-		MaxRequestBodySize: cfg.maxRequestBodySize,
-		EnableA2A:          cfg.enableA2A,
+		Logger:         a.logger.With("component", "router"),
+		SessionCache:   a.sessionCache,
+		ElicitationMap: a.elicitMap,
+		EnableA2A:      cfg.enableA2A,
 	}
 
 	if a.mcpConfig == nil {
@@ -25,10 +25,22 @@ func (a *app) createRouter() {
 	}
 	a.server.RoutingConfig.Store(a.mcpConfig)
 
+	// shared across both routers so a config reload rebuilding the Checker
+	// (see ExtProcServer.OnConfigChange) is visible to whichever router
+	// handles the request, without either router importing mcp-router.
+	guardrailsChecker := func() guardrails.Checker {
+		p := a.server.GuardrailsChecker.Load()
+		if p == nil {
+			return nil
+		}
+		return *p
+	}
+
 	a.server.Router202607 = &routing.Router202607{
-		Table:         a.mcpBroker.RoutingTable,
-		RoutingConfig: &a.server.RoutingConfig,
-		Logger:        a.logger.With("component", "router-202607"),
+		Table:             a.mcpBroker.RoutingTable,
+		RoutingConfig:     &a.server.RoutingConfig,
+		Logger:            a.logger.With("component", "router-202607"),
+		GuardrailsChecker: guardrailsChecker,
 	}
 	a.server.ResponseHandler2026 = &routing.ResponseHandler202607{
 		Logger: a.logger.With("component", "response-handler-202607"),
@@ -45,6 +57,7 @@ func (a *app) createRouter() {
 		TokenElicitationMap: a.tokenElicitMap,
 		ElicitationEnabled:  cfg.enableURLElicitation,
 		Logger:              a.logger.With("component", "router-202511"),
+		GuardrailsChecker:   guardrailsChecker,
 	}
 
 	a.server.ResponseHandler = &routing.ResponseHandler202511{

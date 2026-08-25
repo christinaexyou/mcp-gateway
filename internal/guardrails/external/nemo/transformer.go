@@ -55,12 +55,13 @@ func NewTransformer(model string) *Transformer {
 	return &Transformer{Model: model}
 }
 
-// TransformRequest translates a tools/call request into a NeMo
-// /v1/guardrail/checks request body. Maps params.name to messages[0].name,
-// params.arguments (JSON-encoded) to messages[0].content, and role to
-// "user".
-func (t *Transformer) TransformRequest(toolName string, arguments json.RawMessage, configIDs []string) ([]byte, error) {
-	if toolName == "" {
+// TransformRequest translates a tools/call or elicitation accept into a NeMo
+// /v1/guardrail/checks request body. Maps name to messages[0].name,
+// arguments (JSON-encoded) to messages[0].content, and role to "user".
+// messageConfig is NeMo messages[0].config ("tool" for tools/call; empty for
+// elicitation accept).
+func (t *Transformer) TransformRequest(name string, arguments json.RawMessage, configIDs []string, messageConfig string) ([]byte, error) {
+	if name == "" {
 		return nil, fmt.Errorf("nemo: tool name is required")
 	}
 
@@ -78,9 +79,9 @@ func (t *Transformer) TransformRequest(toolName string, arguments json.RawMessag
 		Messages: []Message{
 			{
 				Role:    "user",
-				Name:    toolName,
+				Name:    name,
 				Content: quoted,
-				Config:  "tool",
+				Config:  messageConfig,
 			},
 		},
 		Guardrails: GuardrailsConfig{

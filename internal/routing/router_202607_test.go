@@ -2,12 +2,14 @@ package routing
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"sync/atomic"
 	"testing"
 
 	"github.com/Kuadrant/mcp-gateway/internal/config"
+	"github.com/Kuadrant/mcp-gateway/internal/guardrails"
 	"github.com/stretchr/testify/require"
 	"k8s.io/utils/ptr"
 )
@@ -159,6 +161,39 @@ func TestRouter202607_HeaderBodyMismatch(t *testing.T) {
 	require.Equal(t, 200, decision.Error.StatusCode)
 	require.Contains(t, decision.Error.JSONRPCErr, "HeaderMismatch")
 	require.Contains(t, decision.Error.JSONRPCErr, "-32602")
+}
+
+func TestRouter202607_HeaderBodyMismatchSkipsGuardrails(t *testing.T) {
+	serverConfigs := []*config.MCPServer{
+		{
+			Name:     "plain",
+			URL:      "http://localhost:8080/mcp",
+			State:    "Enabled",
+			Hostname: "localhost",
+		},
+	}
+	fc := &fakeChecker{decision: &guardrails.Decision{Status: guardrails.StatusBlocked}}
+	router := newTestRouter202607(t, serverConfigs, map[string]string{"actual_name": "plain"}, map[string]string{})
+	router.GuardrailsChecker = func() guardrails.Checker { return fc }
+	router.RoutingConfig.Store(&config.MCPServersConfig{
+		Servers:          serverConfigs,
+		GlobalGuardrails: &config.GuardrailsConfig{ConfigIDs: []string{"global-1"}},
+	})
+
+	decision := router.RouteRequest(context.Background(), &Request{
+		MCPMethod: MethodToolCall,
+		MCPName:   "actual_name",
+		RequestID: "req-1",
+		Parsed: &MCPRequest{
+			ID:      ptr.To(1),
+			JSONRPC: "2.0",
+			Method:  "tools/call",
+			Params:  map[string]any{"name": "different_name"},
+		},
+	})
+	require.NotNil(t, decision.Error)
+	require.Contains(t, decision.Error.JSONRPCErr, "HeaderMismatch")
+	require.Equal(t, 0, fc.calls)
 }
 
 func TestRouter202607_PromptGet(t *testing.T) {
@@ -402,6 +437,113 @@ func TestRouter202607_EmptyPromptName(t *testing.T) {
 	require.NotNil(t, decision.Error)
 	require.Equal(t, 400, decision.Error.StatusCode)
 	require.Equal(t, "no prompt name set", decision.Error.Message)
+}
+
+// TestRouter202607_ToolCall_Guardrails mirrors
+// TestRouteToolCall_Guardrails for the header-based protocol: allow, block,
+// failMode deny/allow fallbacks, and the two skip paths (no Checker, empty
+// merged config IDs).
+func TestRouter202607_ToolCall_Guardrails(t *testing.T) {
+	newGuardedRouter := func(t *testing.T, fc *fakeChecker, serverConfigIDs, globalConfigIDs []string) *Router202607 {
+		t.Helper()
+		serverConfigs := []*config.MCPServer{
+			{
+				Name:     "prefixed",
+				URL:      "http://localhost:8080/mcp",
+				Prefix:   "s_",
+				State:    "Enabled",
+				Hostname: "localhost",
+			},
+		}
+		router := newTestRouter202607(t, serverConfigs, map[string]string{}, map[string]string{})
+		router.Table = func() RoutingTable {
+			return NewTableBuilder().
+				AddTool("s_mytool", &ServerRoute{
+					Name:                "prefixed",
+					Host:                "localhost",
+					Prefix:              "s_",
+					Path:                "/mcp",
+					URL:                 "http://localhost:8080/mcp",
+					GuardrailsConfigIDs: serverConfigIDs,
+				}).
+				Build()
+		}
+		if fc != nil {
+			router.GuardrailsChecker = func() guardrails.Checker { return fc }
+		}
+		router.RoutingConfig.Store(&config.MCPServersConfig{
+			Servers:          serverConfigs,
+			GlobalGuardrails: &config.GuardrailsConfig{ConfigIDs: globalConfigIDs},
+		})
+		return router
+	}
+
+	toolCallReq := func() *Request {
+		return &Request{
+			MCPMethod: MethodToolCall,
+			MCPName:   "s_mytool",
+			RequestID: "req-1",
+			Parsed: &MCPRequest{
+				ID:      ptr.To(1),
+				JSONRPC: "2.0",
+				Method:  "tools/call",
+				Params:  map[string]any{"name": "s_mytool", "arguments": map[string]any{"x": 1}},
+			},
+		}
+	}
+
+	t.Run("no checker with config IDs fail closed", func(t *testing.T) {
+		router := newGuardedRouter(t, nil, []string{"svr-1"}, nil)
+		decision := router.RouteRequest(context.Background(), toolCallReq())
+		require.NotNil(t, decision.Error)
+		require.Equal(t, 503, decision.Error.StatusCode)
+		require.Contains(t, decision.Error.JSONRPCErr, guardrailsUnavailableMessage)
+	})
+
+	t.Run("checker configured but merged config IDs empty skips check", func(t *testing.T) {
+		fc := &fakeChecker{decision: &guardrails.Decision{Status: guardrails.StatusBlocked}}
+		router := newGuardedRouter(t, fc, nil, nil)
+		decision := router.RouteRequest(context.Background(), toolCallReq())
+		require.Nil(t, decision.Error)
+		require.Equal(t, 0, fc.calls)
+	})
+
+	t.Run("allowed routes to upstream", func(t *testing.T) {
+		fc := &fakeChecker{decision: &guardrails.Decision{Status: guardrails.StatusAllowed}}
+		router := newGuardedRouter(t, fc, []string{"svr-1"}, []string{"global-1"})
+		decision := router.RouteRequest(context.Background(), toolCallReq())
+		require.Nil(t, decision.Error)
+		require.Equal(t, "localhost", decision.Authority)
+		require.Equal(t, 1, fc.calls)
+		require.Equal(t, "mytool", fc.lastToolName)
+	})
+
+	t.Run("blocked returns 403 JSON-RPC error, never reaches upstream", func(t *testing.T) {
+		fc := &fakeChecker{decision: &guardrails.Decision{Status: guardrails.StatusBlocked, Reason: "unsafe"}}
+		router := newGuardedRouter(t, fc, []string{"svr-1"}, nil)
+		decision := router.RouteRequest(context.Background(), toolCallReq())
+		require.NotNil(t, decision.Error)
+		require.Equal(t, 403, decision.Error.StatusCode)
+		require.Contains(t, decision.Error.JSONRPCErr, "unsafe")
+		require.Empty(t, decision.Authority)
+	})
+
+	t.Run("failMode deny fallback returns 503 JSON-RPC", func(t *testing.T) {
+		fc := &fakeChecker{decision: &guardrails.Decision{Status: guardrails.StatusBlocked, Err: errors.New("transport error")}}
+		router := newGuardedRouter(t, fc, []string{"svr-1"}, nil)
+		decision := router.RouteRequest(context.Background(), toolCallReq())
+		require.NotNil(t, decision.Error)
+		require.Equal(t, 503, decision.Error.StatusCode)
+		require.Contains(t, decision.Error.JSONRPCErr, guardrailsUnavailableMessage)
+	})
+
+	t.Run("failMode allow fallback routes to upstream", func(t *testing.T) {
+		fc := &fakeChecker{decision: &guardrails.Decision{Status: guardrails.StatusAllowed, Err: errors.New("transport error")}}
+		router := newGuardedRouter(t, fc, []string{"svr-1"}, nil)
+		decision := router.RouteRequest(context.Background(), toolCallReq())
+		require.Nil(t, decision.Error)
+		require.Equal(t, "localhost", decision.Authority)
+	})
 }
 
 func TestRouter202607_BrokerPassthroughReInjectsInternalHeaders(t *testing.T) {

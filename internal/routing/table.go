@@ -25,6 +25,7 @@ type ServerRoute struct {
 	URL                 string
 	TokenURLElicitation *TokenURLElicitationRoute
 	UserSpecificList    bool
+	GuardrailsConfigIDs []string
 }
 
 // TokenURLElicitationRoute holds the URL elicitation config relevant to routing.

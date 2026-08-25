@@ -15,6 +15,7 @@ func TestNeMoTransformer_TransformRequest(t *testing.T) {
 			"execute_sql",
 			json.RawMessage(`{"query": "DROP TABLE users"}`),
 			[]string{"tool-safety-v1", "input_checking"},
+			"tool",
 		)
 		require.NoError(t, err)
 		require.JSONEq(t, `{
@@ -32,7 +33,7 @@ func TestNeMoTransformer_TransformRequest(t *testing.T) {
 	t.Run("defaults arguments to an empty object when absent", func(t *testing.T) {
 		transformer := NewTransformer("meta/llama-3.1-8b-instruct")
 
-		body, err := transformer.TransformRequest("no_args_tool", nil, nil)
+		body, err := transformer.TransformRequest("no_args_tool", nil, nil, "tool")
 		require.NoError(t, err)
 
 		var got CheckRequest
@@ -44,8 +45,25 @@ func TestNeMoTransformer_TransformRequest(t *testing.T) {
 	t.Run("errors without a tool name", func(t *testing.T) {
 		transformer := NewTransformer("meta/llama-3.1-8b-instruct")
 
-		_, err := transformer.TransformRequest("", json.RawMessage(`{}`), nil)
+		_, err := transformer.TransformRequest("", json.RawMessage(`{}`), nil, "tool")
 		require.Error(t, err)
+	})
+
+	t.Run("omits config tag when messageConfig is empty", func(t *testing.T) {
+		transformer := NewTransformer("meta/llama-3.1-8b-instruct")
+
+		body, err := transformer.TransformRequest("accept", json.RawMessage(`{"content":{"name":"test"}}`), nil, "")
+		require.NoError(t, err)
+		require.JSONEq(t, `{
+			"model": "meta/llama-3.1-8b-instruct",
+			"messages": [{
+				"role": "user",
+				"name": "accept",
+				"content": "{\"content\":{\"name\":\"test\"}}"
+			}],
+			"guardrails": {"config_ids": []}
+		}`, string(body))
+		require.NotContains(t, string(body), `"config"`)
 	})
 }
 

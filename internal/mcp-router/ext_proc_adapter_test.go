@@ -349,7 +349,9 @@ func TestProcessSpanEnded(t *testing.T) {
 
 func TestProcess_BufferedBodyExceedsMaxSize(t *testing.T) {
 	srv := newTestServer(t)
-	srv.MaxRequestBodySize = 50
+	cfg := &config.MCPServersConfig{}
+	cfg.SetMaxBodyBytes(50)
+	srv.RoutingConfig.Store(cfg)
 
 	mock := makeMockProcessServer(t, []mockProcessServerMessageAndErr{
 		requestHeadersStep(),
@@ -372,6 +374,131 @@ func TestProcess_BufferedBodyExceedsMaxSize(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "request body too large")
 	mock.verifyAllResponsesConsumed()
+}
+
+// TestProcess_RequestBody_MultiChunkAccumulation covers the defensive
+// streamed-body path: a request body split across multiple RequestBody
+// messages (EndOfStream false until the last one) must be accumulated and
+// routed only once, using the full body, not routed per-chunk. Inert under
+// today's static BUFFERED Envoy config, but exercises the accumulation this
+// F3 change adds for forward-compatibility with streamed request bodies.
+func TestProcess_RequestBody_MultiChunkAccumulation(t *testing.T) {
+	srv := newTestServer(t)
+
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	split := 20
+	require.Less(t, split, len(body))
+
+	mock := makeMockProcessServer(t, []mockProcessServerMessageAndErr{
+		requestHeadersStep(),
+		// first chunk: not EndOfStream, so no routing yet, just a do-nothing ack
+		{
+			msg: &extProcV3.ProcessingRequest{
+				Request: &extProcV3.ProcessingRequest_RequestBody{
+					RequestBody: &extProcV3.HttpBody{
+						Body:        body[:split],
+						EndOfStream: false,
+					},
+				},
+			},
+			resp: []*extProcV3.ProcessingResponse{
+				{
+					Response: &extProcV3.ProcessingResponse_RequestBody{
+						RequestBody: &extProcV3.BodyResponse{
+							Response: &extProcV3.CommonResponse{},
+						},
+					},
+				},
+			},
+		},
+		// final chunk: EndOfStream true, routes using the full accumulated body
+		{
+			msg: &extProcV3.ProcessingRequest{
+				Request: &extProcV3.ProcessingRequest_RequestBody{
+					RequestBody: &extProcV3.HttpBody{
+						Body:        body[split:],
+						EndOfStream: true,
+					},
+				},
+			},
+			resp: []*extProcV3.ProcessingResponse{
+				{
+					Response: &extProcV3.ProcessingResponse_RequestBody{
+						RequestBody: &extProcV3.BodyResponse{
+							Response: &extProcV3.CommonResponse{
+								HeaderMutation: &extProcV3.HeaderMutation{
+									SetHeaders: []*corev3.HeaderValueOption{
+										{Header: &corev3.HeaderValue{Key: "x-mcp-method", RawValue: []byte("tools/list")}},
+										{Header: &corev3.HeaderValue{Key: "x-mcp-servername", RawValue: []byte("mcpBroker")}},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		responseHeadersStep(),
+	})
+
+	err := srv.Process(mock)
+	require.NoError(t, err)
+	mock.verifyAllResponsesConsumed()
+}
+
+// TestProcess_RequestBody_AccumulationExceedsMaxSize verifies the defensive
+// accumulation cap: once accumulated chunks exceed config.DefaultMaxBodyBytes
+// the request is rejected with 413, regardless of failMode (this cap has
+// nothing to do with guardrails failMode; it protects the router itself).
+func TestProcess_RequestBody_AccumulationExceedsMaxSize(t *testing.T) {
+	srv := newTestServer(t)
+
+	oversized := make([]byte, int(config.DefaultMaxBodyBytes)+1)
+
+	mock := makeMockProcessServer(t, []mockProcessServerMessageAndErr{
+		requestHeadersStep(),
+		{
+			msg: &extProcV3.ProcessingRequest{
+				Request: &extProcV3.ProcessingRequest_RequestBody{
+					RequestBody: &extProcV3.HttpBody{
+						Body:        oversized,
+						EndOfStream: true,
+					},
+				},
+			},
+			resp: []*extProcV3.ProcessingResponse{
+				immediateResponse(413),
+			},
+		},
+	})
+
+	err := srv.Process(mock)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "request body too large")
+	mock.verifyAllResponsesConsumed()
+}
+
+// TestExtProcServer_OnConfigChange_RebuildsGuardrailsChecker verifies the F3
+// Checker lifecycle: a GlobalGuardrails config builds a Checker, and removing
+// it on a later config change tears the Checker back down.
+func TestExtProcServer_OnConfigChange_RebuildsGuardrailsChecker(t *testing.T) {
+	server := &ExtProcServer{Logger: slog.Default()}
+	server.RoutingConfig.Store(&config.MCPServersConfig{})
+	require.Nil(t, server.GuardrailsChecker.Load(), "no checker before any guardrails config is seen")
+
+	server.OnConfigChange(context.Background(), &config.MCPServersConfig{
+		GlobalGuardrails: &config.GuardrailsConfig{
+			URL:       "https://guardrails.local",
+			Model:     "test-model",
+			ConfigIDs: []string{"config-a"},
+		},
+	})
+	checkerPtr := server.GuardrailsChecker.Load()
+	require.NotNil(t, checkerPtr)
+	require.NotNil(t, *checkerPtr, "GlobalGuardrails config must produce a non-nil Checker")
+
+	server.OnConfigChange(context.Background(), &config.MCPServersConfig{})
+	require.Nil(t, server.GuardrailsChecker.Load(), "clearing GlobalGuardrails must tear down the Checker")
 }
 
 func newTestServer(t *testing.T) *ExtProcServer {

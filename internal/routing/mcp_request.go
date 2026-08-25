@@ -190,12 +190,67 @@ func (mr *MCPRequest) ToolName() string {
 	return t
 }
 
+// IsElicitationAccept reports whether this is an elicitation response with
+// action accept. decline/cancel bypass guardrails (no user content).
+func (mr *MCPRequest) IsElicitationAccept() bool {
+	return mr.IsElicitationResponse() && mr.elicitationAction() == elicitationActionAccept
+}
+
+func (mr *MCPRequest) elicitationAction() string {
+	if mr.Result == nil {
+		return ""
+	}
+	action, ok := mr.Result[elicitationResultAction].(string)
+	if !ok {
+		return ""
+	}
+	return action
+}
+
+// ElicitationArguments is result minus action, JSON-encoded, for the
+// elicitation-accept guardrails mapping.
+func (mr *MCPRequest) ElicitationArguments() (json.RawMessage, error) {
+	if mr.Result == nil {
+		return json.RawMessage(`{}`), nil
+	}
+	rest := make(map[string]any, len(mr.Result))
+	for k, v := range mr.Result {
+		if k == elicitationResultAction {
+			continue
+		}
+		rest[k] = v
+	}
+	if len(rest) == 0 {
+		return json.RawMessage(`{}`), nil
+	}
+	raw, err := json.Marshal(rest)
+	if err != nil {
+		return nil, fmt.Errorf("marshal elicitation result: %w", err)
+	}
+	return raw, nil
+}
+
 // ReWriteToolName replaces tool name in params
 func (mr *MCPRequest) ReWriteToolName(actualTool string) {
 	if mr.Params == nil {
 		mr.Params = map[string]any{}
 	}
 	mr.Params["name"] = actualTool
+}
+
+// Arguments re-marshals the tools/call params.arguments value to
+// json.RawMessage, since Params is decoded as map[string]any. Returns nil
+// when there are no arguments (valid: many tools take none).
+func (mr *MCPRequest) Arguments() (json.RawMessage, error) {
+	args, ok := mr.Params["arguments"]
+	if !ok || args == nil {
+		return nil, nil
+	}
+	raw, err := json.Marshal(args)
+	if err != nil {
+		return nil, fmt.Errorf("marshal arguments: %w", err)
+	}
+	return raw, nil
 }
 
 // IsPromptGet checks if method is prompts/get
@@ -305,6 +360,16 @@ func BuildJSONToolError(requestID any, message string) string {
 	b.WriteString(jsonQuote(message))
 	b.WriteString("}],\"isError\":true}}")
 	return b.String()
+}
+
+// BuildSSEJSONRPCError constructs an SSE-framed JSON-RPC error object for a
+// blocked elicitation accept (not a tools/call isError result).
+func BuildSSEJSONRPCError(requestID any, message string) string {
+	return SseJSONRPC(requestID, func(b *strings.Builder) {
+		b.WriteString(",\"error\":{\"code\":-32000,\"message\":")
+		b.WriteString(jsonQuote(message))
+		b.WriteString("}}")
+	})
 }
 
 func jsonQuote(s string) string {

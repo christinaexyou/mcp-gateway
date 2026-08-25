@@ -12,11 +12,12 @@ func (m *mcpBrokerImpl) buildRoutingTable() *routing.Table {
 	for id, up := range m.mcpServers {
 		cfg := up.Config()
 		route := &routing.ServerRoute{
-			Name:             cfg.Name,
-			Host:             cfg.Hostname,
-			Prefix:           cfg.Prefix,
-			URL:              cfg.URL,
-			UserSpecificList: cfg.UserSpecificList,
+			Name:                cfg.Name,
+			Host:                cfg.Hostname,
+			Prefix:              cfg.Prefix,
+			URL:                 cfg.URL,
+			UserSpecificList:    cfg.UserSpecificList,
+			GuardrailsConfigIDs: cfg.GuardrailsConfigIDs,
 		}
 		if p, err := cfg.Path(); err == nil {
 			route.Path = p
