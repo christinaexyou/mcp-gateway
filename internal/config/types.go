@@ -23,6 +23,8 @@ type MCPServersConfig struct {
 	MCPGatewayExternalHostname string
 	MCPGatewayInternalHostname string
 	GatewayCACertPEM           string
+	GlobalGuardrails           *GuardrailsConfig
+	MaxBodyBytes               int64
 }
 
 // RegisterObserver registers an observer to be notified of changes to the config
@@ -81,6 +83,46 @@ func (config *MCPServersConfig) GetGatewayCACertPEM() string {
 	config.lock.RLock()
 	defer config.lock.RUnlock()
 	return config.GatewayCACertPEM
+}
+
+// SetGlobalGuardrails sets the gateway-level guardrails config, resolved
+// from the Secret referenced by the guardrails-ref annotation. Nil clears it.
+func (config *MCPServersConfig) SetGlobalGuardrails(guardrails *GuardrailsConfig) {
+	config.lock.Lock()
+	defer config.lock.Unlock()
+	config.GlobalGuardrails = guardrails
+}
+
+// GetGlobalGuardrails returns the gateway-level guardrails config, or nil
+// when guardrails isn't configured.
+func (config *MCPServersConfig) GetGlobalGuardrails() *GuardrailsConfig {
+	config.lock.RLock()
+	defer config.lock.RUnlock()
+	return config.GlobalGuardrails
+}
+
+// DefaultMaxBodyBytes is 1 MiB. Must match the MCPGatewayExtensionSpec.maxBodyBytes
+// kubebuilder +default literal.
+const DefaultMaxBodyBytes int64 = 1048576
+
+// SetMaxBodyBytes sets the router body-buffer cap from the
+// MCPGatewayExtension spec. Non-positive values are treated as the default
+// by GetMaxBodyBytes.
+func (config *MCPServersConfig) SetMaxBodyBytes(n int64) {
+	config.lock.Lock()
+	defer config.lock.Unlock()
+	config.MaxBodyBytes = n
+}
+
+// GetMaxBodyBytes returns the router body-buffer cap, defaulting to
+// DefaultMaxBodyBytes when unset.
+func (config *MCPServersConfig) GetMaxBodyBytes() int64 {
+	config.lock.RLock()
+	defer config.lock.RUnlock()
+	if config.MaxBodyBytes > 0 {
+		return config.MaxBodyBytes
+	}
+	return DefaultMaxBodyBytes
 }
 
 // GetExternalHostname returns the public hostname of the gateway
@@ -235,6 +277,24 @@ type BrokerConfig struct {
 	// parsed from the Secret referenced by the guardrails-ref annotation. Nil
 	// when guardrails isn't configured.
 	GlobalGuardrails *GuardrailsConfig `json:"globalGuardrails,omitempty" yaml:"globalGuardrails,omitempty"`
+	// MaxBodyBytes caps any body the router buffers, from MCPGatewayExtension.spec.maxBodyBytes.
+	MaxBodyBytes int64 `json:"maxBodyBytes,omitempty" yaml:"maxBodyBytes,omitempty"`
+}
+
+// ExtensionOwnedConfig is a patch of MCPGatewayExtension-owned BrokerConfig
+// fields. Nil pointers leave the existing Secret value unchanged so a
+// validation failure in one field cannot clobber another.
+type ExtensionOwnedConfig struct {
+	GatewayCACertPEM *string
+	// GlobalGuardrails is set when guardrails resolved; a non-nil wrapper
+	// with a nil Config clears the field.
+	GlobalGuardrails *GuardrailsUpdate
+	MaxBodyBytes     *int64
+}
+
+// GuardrailsUpdate wraps *GuardrailsConfig so "clear" is distinct from "omit".
+type GuardrailsUpdate struct {
+	Config *GuardrailsConfig
 }
 
 // AuthConfig holds auth configuration

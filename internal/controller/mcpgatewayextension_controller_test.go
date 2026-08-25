@@ -205,11 +205,7 @@ func (m *mockConfigWriterDeleter) WriteEmptyConfig(ctx context.Context, namespac
 	return nil
 }
 
-func (m *mockConfigWriterDeleter) WriteCACertBundle(ctx context.Context, caCertPEM string, namespaceName types.NamespacedName) error {
-	return nil
-}
-
-func (m *mockConfigWriterDeleter) WriteGlobalGuardrails(ctx context.Context, guardrailsConfig *config.GuardrailsConfig, namespaceName types.NamespacedName) error {
+func (m *mockConfigWriterDeleter) WriteExtensionConfig(ctx context.Context, ext config.ExtensionOwnedConfig, namespaceName types.NamespacedName) error {
 	return nil
 }
 

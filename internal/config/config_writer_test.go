@@ -3,12 +3,15 @@ package config
 import (
 	"context"
 	"log/slog"
+	"slices"
+	"strings"
 	"testing"
 
 	mcpv1 "github.com/Kuadrant/mcp-gateway/api/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/yaml"
 )
@@ -223,63 +226,162 @@ func TestDeleteConfig(t *testing.T) {
 	}
 }
 
-func TestWriteGlobalGuardrails(t *testing.T) {
-	testCases := []struct {
-		name       string
-		guardrails *GuardrailsConfig
-	}{
-		{
-			name: "writes resolved guardrails config",
-			guardrails: &GuardrailsConfig{
-				URL:       "https://nemo-guardrails.internal:8080",
-				ConfigIDs: []string{"tool-safety-v1"},
-				Model:     "meta/llama-3.1-8b-instruct",
-				FailMode:  "deny",
-			},
-		},
-		{
-			name:       "nil clears guardrails config",
-			guardrails: nil,
-		},
+type countingClient struct {
+	client.Client
+	creates int
+	updates int
+}
+
+func (c *countingClient) Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
+	c.creates++
+	return c.Client.Create(ctx, obj, opts...)
+}
+
+func (c *countingClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	c.updates++
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+func TestWriteExtensionConfig(t *testing.T) {
+	ctx := context.Background()
+	namespaceName := types.NamespacedName{Namespace: "test-ns", Name: "mcp-gateway-config"}
+	rails := &GuardrailsConfig{
+		URL:       "https://nemo-guardrails.internal:8080",
+		ConfigIDs: []string{"tool-safety-v1"},
+		Model:     "meta/llama-3.1-8b-instruct",
+		FailMode:  "deny",
+	}
+	fullPatch := ExtensionOwnedConfig{
+		GatewayCACertPEM: ptr("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"),
+		GlobalGuardrails: &GuardrailsUpdate{Config: rails},
+		MaxBodyBytes:     ptr(DefaultMaxBodyBytes),
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			srw := newTestSecretReaderWriter(t)
-			ctx := context.Background()
-			namespaceName := types.NamespacedName{Namespace: "test-ns", Name: "mcp-gateway-config"}
+	t.Run("missing secret is one Create", func(t *testing.T) {
+		srw := newTestSecretReaderWriter(t)
+		counter := &countingClient{Client: srw.Client}
+		srw.Client = counter
 
-			// seed with a non-nil value so the "clears" case exercises an actual change.
-			if err := srw.WriteGlobalGuardrails(ctx, &GuardrailsConfig{URL: "https://seed.internal", Model: "seed-model"}, namespaceName); err != nil {
-				t.Fatalf("seed WriteGlobalGuardrails failed: %v", err)
-			}
+		if err := srw.WriteExtensionConfig(ctx, fullPatch, namespaceName); err != nil {
+			t.Fatalf("WriteExtensionConfig: %v", err)
+		}
+		if counter.creates != 1 || counter.updates != 0 {
+			t.Fatalf("creates=%d updates=%d, want 1 create and 0 updates", counter.creates, counter.updates)
+		}
 
-			if err := srw.WriteGlobalGuardrails(ctx, tc.guardrails, namespaceName); err != nil {
-				t.Fatalf("WriteGlobalGuardrails failed: %v", err)
-			}
+		cfg := readTestBrokerConfig(t, srw, namespaceName)
+		if cfg.GatewayCACertPEM != *fullPatch.GatewayCACertPEM {
+			t.Fatalf("GatewayCACertPEM = %q", cfg.GatewayCACertPEM)
+		}
+		if cfg.GlobalGuardrails == nil || cfg.GlobalGuardrails.URL != rails.URL ||
+			cfg.GlobalGuardrails.Model != rails.Model || cfg.GlobalGuardrails.FailMode != rails.FailMode ||
+			!slices.Equal(cfg.GlobalGuardrails.ConfigIDs, rails.ConfigIDs) {
+			t.Fatalf("GlobalGuardrails = %+v, want %+v", cfg.GlobalGuardrails, rails)
+		}
+		if cfg.MaxBodyBytes != DefaultMaxBodyBytes {
+			t.Fatalf("MaxBodyBytes = %d, want %d", cfg.MaxBodyBytes, DefaultMaxBodyBytes)
+		}
+		if cfg.Servers == nil {
+			t.Fatal("Servers is nil, want empty slice")
+		}
+		raw := secretYAML(t, srw, namespaceName)
+		if !strings.Contains(raw, "servers: []") || strings.Contains(raw, "servers: null") {
+			t.Fatalf("Create YAML = %q, want servers: []", raw)
+		}
+	})
 
-			secret := &corev1.Secret{}
-			if err := srw.Client.Get(ctx, namespaceName, secret); err != nil {
-				t.Fatalf("failed to get secret: %v", err)
-			}
+	t.Run("identical write is a no-op", func(t *testing.T) {
+		srw := newTestSecretReaderWriter(t)
+		if err := srw.WriteExtensionConfig(ctx, fullPatch, namespaceName); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		counter := &countingClient{Client: srw.Client}
+		srw.Client = counter
+		if err := srw.WriteExtensionConfig(ctx, fullPatch, namespaceName); err != nil {
+			t.Fatalf("WriteExtensionConfig: %v", err)
+		}
+		if counter.creates != 0 || counter.updates != 0 {
+			t.Fatalf("creates=%d updates=%d, want no writes", counter.creates, counter.updates)
+		}
+	})
 
-			configData := secret.StringData[configFileName]
-			if configData == "" {
-				configData = string(secret.Data[configFileName])
-			}
-			var cfg BrokerConfig
-			if err := yaml.Unmarshal([]byte(configData), &cfg); err != nil {
-				t.Fatalf("failed to unmarshal config: %v", err)
-			}
+	t.Run("omitted guardrails preserves existing and keeps servers", func(t *testing.T) {
+		srw := newTestSecretReaderWriter(t)
+		if err := srw.UpsertMCPServer(ctx, MCPServer{
+			Name: "keep-me", URL: "http://keep.local/mcp", State: string(mcpv1.ServerStateEnabled),
+		}, namespaceName); err != nil {
+			t.Fatalf("UpsertMCPServer: %v", err)
+		}
+		if err := srw.WriteExtensionConfig(ctx, fullPatch, namespaceName); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if err := srw.WriteExtensionConfig(ctx, ExtensionOwnedConfig{
+			MaxBodyBytes: ptr(int64(4096)),
+		}, namespaceName); err != nil {
+			t.Fatalf("WriteExtensionConfig: %v", err)
+		}
+		cfg := readTestBrokerConfig(t, srw, namespaceName)
+		if len(cfg.Servers) != 1 || cfg.Servers[0].Name != "keep-me" {
+			t.Fatalf("servers = %+v, want keep-me preserved", cfg.Servers)
+		}
+		if cfg.GlobalGuardrails == nil || !slices.Equal(cfg.GlobalGuardrails.ConfigIDs, rails.ConfigIDs) {
+			t.Fatalf("GlobalGuardrails = %+v, want preserved", cfg.GlobalGuardrails)
+		}
+		if cfg.GatewayCACertPEM != *fullPatch.GatewayCACertPEM {
+			t.Fatalf("GatewayCACertPEM cleared")
+		}
+		if cfg.MaxBodyBytes != 4096 {
+			t.Fatalf("MaxBodyBytes = %d, want 4096", cfg.MaxBodyBytes)
+		}
+	})
 
-			if (cfg.GlobalGuardrails == nil) != (tc.guardrails == nil) {
-				t.Fatalf("GlobalGuardrails = %+v, want %+v", cfg.GlobalGuardrails, tc.guardrails)
-			}
-			if tc.guardrails != nil {
-				if cfg.GlobalGuardrails.URL != tc.guardrails.URL || cfg.GlobalGuardrails.Model != tc.guardrails.Model {
-					t.Fatalf("GlobalGuardrails = %+v, want %+v", cfg.GlobalGuardrails, tc.guardrails)
-				}
-			}
-		})
+	t.Run("nil guardrails config clears that field", func(t *testing.T) {
+		srw := newTestSecretReaderWriter(t)
+		if err := srw.WriteExtensionConfig(ctx, fullPatch, namespaceName); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if err := srw.WriteExtensionConfig(ctx, ExtensionOwnedConfig{
+			GlobalGuardrails: &GuardrailsUpdate{Config: nil},
+		}, namespaceName); err != nil {
+			t.Fatalf("WriteExtensionConfig: %v", err)
+		}
+		cfg := readTestBrokerConfig(t, srw, namespaceName)
+		if cfg.GlobalGuardrails != nil {
+			t.Fatalf("GlobalGuardrails = %+v, want nil", cfg.GlobalGuardrails)
+		}
+		if cfg.GatewayCACertPEM != *fullPatch.GatewayCACertPEM || cfg.MaxBodyBytes != DefaultMaxBodyBytes {
+			t.Fatalf("other fields changed: %+v", cfg)
+		}
+	})
+}
+
+func ptr[T any](v T) *T { return &v }
+
+func readTestBrokerConfig(t *testing.T, srw *SecretReaderWriter, namespaceName types.NamespacedName) BrokerConfig {
+	t.Helper()
+	secret := &corev1.Secret{}
+	if err := srw.Client.Get(context.Background(), namespaceName, secret); err != nil {
+		t.Fatalf("failed to get secret: %v", err)
 	}
+	configData := secret.StringData[configFileName]
+	if configData == "" {
+		configData = string(secret.Data[configFileName])
+	}
+	var cfg BrokerConfig
+	if err := yaml.Unmarshal([]byte(configData), &cfg); err != nil {
+		t.Fatalf("failed to unmarshal config: %v", err)
+	}
+	return cfg
+}
+
+func secretYAML(t *testing.T, srw *SecretReaderWriter, namespaceName types.NamespacedName) string {
+	t.Helper()
+	secret := &corev1.Secret{}
+	if err := srw.Client.Get(context.Background(), namespaceName, secret); err != nil {
+		t.Fatalf("failed to get secret: %v", err)
+	}
+	if s := secret.StringData[configFileName]; s != "" {
+		return s
+	}
+	return string(secret.Data[configFileName])
 }

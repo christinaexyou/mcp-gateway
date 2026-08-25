@@ -106,20 +106,7 @@ func (srw *SecretReaderWriter) readOrCreateConfigSecret(ctx context.Context, nam
 			return nil, nil, fmt.Errorf("failed to read config secret: %w", err)
 		}
 		// create empty secret
-		configSecret = &corev1.Secret{
-			ObjectMeta: v1.ObjectMeta{
-				Name:      namespaceName.Name,
-				Namespace: namespaceName.Namespace,
-				Labels: map[string]string{
-					"app":                        "mcp-gateway",
-					"mcp.kuadrant.io/aggregated": "true",
-					"mcp.kuadrant.io/secret":     "true",
-				},
-			},
-			StringData: map[string]string{
-				configFileName: emptyConfigFile,
-			},
-		}
+		configSecret = newConfigSecret(namespaceName, emptyConfigFile)
 		if err := srw.Client.Create(ctx, configSecret); err != nil {
 			if !errors.IsAlreadyExists(err) {
 				return nil, nil, fmt.Errorf("failed to create config secret: %w", err)
@@ -131,26 +118,67 @@ func (srw *SecretReaderWriter) readOrCreateConfigSecret(ctx context.Context, nam
 		}
 	}
 
-	if configSecret.StringData == nil {
-		configSecret.StringData = map[string]string{}
+	existingConfig, err := loadBrokerConfigFromSecret(configSecret)
+	if err != nil {
+		return nil, nil, err
 	}
-	// copy Data to StringData for update
-	if configSecret.Data != nil {
-		if _, ok := configSecret.StringData[configFileName]; !ok {
-			if data, ok := configSecret.Data[configFileName]; ok {
-				configSecret.StringData[configFileName] = string(data)
+	return existingConfig, configSecret, nil
+}
+
+func emptyBrokerConfig() *BrokerConfig {
+	cfg := &BrokerConfig{}
+	_ = yaml.Unmarshal([]byte(emptyConfigFile), cfg)
+	return cfg
+}
+
+func newConfigSecret(namespaceName types.NamespacedName, configYAML string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: v1.ObjectMeta{
+			Name:      namespaceName.Name,
+			Namespace: namespaceName.Namespace,
+			Labels: map[string]string{
+				"app":                        "mcp-gateway",
+				"mcp.kuadrant.io/aggregated": "true",
+				"mcp.kuadrant.io/secret":     "true",
+			},
+		},
+		StringData: map[string]string{
+			configFileName: configYAML,
+		},
+	}
+}
+
+func loadBrokerConfigFromSecret(secret *corev1.Secret) (*BrokerConfig, error) {
+	if secret.StringData == nil {
+		secret.StringData = map[string]string{}
+	}
+	if secret.Data != nil {
+		if _, ok := secret.StringData[configFileName]; !ok {
+			if data, ok := secret.Data[configFileName]; ok {
+				secret.StringData[configFileName] = string(data)
 			}
 		}
 	}
 
 	existingConfig := &BrokerConfig{}
-	if configYAML := configSecret.StringData[configFileName]; configYAML != "" {
+	if configYAML := secret.StringData[configFileName]; configYAML != "" {
 		if err := yaml.Unmarshal([]byte(configYAML), existingConfig); err != nil {
-			return nil, nil, fmt.Errorf("failed to unmarshal broker config: %w", err)
+			return nil, fmt.Errorf("failed to unmarshal broker config: %w", err)
 		}
 	}
+	return existingConfig, nil
+}
 
-	return existingConfig, configSecret, nil
+func storeBrokerConfig(secret *corev1.Secret, cfg *BrokerConfig) error {
+	updated, err := yaml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	if secret.StringData == nil {
+		secret.StringData = map[string]string{}
+	}
+	secret.StringData[configFileName] = string(updated)
+	return nil
 }
 
 // UpsertMCPServer updates or inserts a single MCPServer in the config secret.
@@ -246,53 +274,80 @@ func (srw *SecretReaderWriter) RemoveMCPServer(ctx context.Context, serverName s
 	return lastErr
 }
 
-// WriteCACertBundle updates the gatewayCACertPEM field of the config secret.
-// It uses a read-modify-write pattern to preserve other sections.
-func (srw *SecretReaderWriter) WriteCACertBundle(ctx context.Context, caCertPEM string, namespaceName types.NamespacedName) error {
+// WriteExtensionConfig merges the provided patch into the config Secret in a
+// single Create (if missing) or Update. Omitted patch fields are left as-is.
+func (srw *SecretReaderWriter) WriteExtensionConfig(ctx context.Context, patch ExtensionOwnedConfig, namespaceName types.NamespacedName) error {
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		existingConfig, backingSecret, err := srw.readOrCreateConfigSecret(ctx, namespaceName)
+		secret := &corev1.Secret{}
+		err := srw.Client.Get(ctx, namespaceName, secret)
 		if err != nil {
-			return fmt.Errorf("write ca cert bundle failed to read config secret: %w", err)
+			if !errors.IsNotFound(err) {
+				return fmt.Errorf("write extension config failed to read config secret: %w", err)
+			}
+			cfg := emptyBrokerConfig()
+			applyExtensionOwned(cfg, patch)
+			return srw.createConfigSecret(ctx, namespaceName, cfg, patch)
 		}
 
-		if existingConfig.GatewayCACertPEM == caCertPEM {
+		cfg, err := loadBrokerConfigFromSecret(secret)
+		if err != nil {
+			return fmt.Errorf("write extension config failed to parse config: %w", err)
+		}
+		if !applyExtensionOwned(cfg, patch) {
 			return nil
 		}
-
-		existingConfig.GatewayCACertPEM = caCertPEM
-		updated, err := yaml.Marshal(existingConfig)
-		if err != nil {
-			return fmt.Errorf("write ca cert bundle failed to marshal config: %w", err)
+		if err := storeBrokerConfig(secret, cfg); err != nil {
+			return fmt.Errorf("write extension config failed to marshal config: %w", err)
 		}
-
-		backingSecret.StringData[configFileName] = string(updated)
-		return srw.Client.Update(ctx, backingSecret)
+		return srw.Client.Update(ctx, secret)
 	})
 }
 
-// WriteGlobalGuardrails updates the globalGuardrails field of the config secret
-// with the resolved guardrails config. If guardrails is disabled or its Secret is removed,
-// pass nil to clear the globalGuardrails field.
-func (srw *SecretReaderWriter) WriteGlobalGuardrails(ctx context.Context, guardrailsConfig *GuardrailsConfig, namespaceName types.NamespacedName) error {
-	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		existingConfig, backingSecret, err := srw.readOrCreateConfigSecret(ctx, namespaceName)
-		if err != nil {
-			return fmt.Errorf("write global guardrails failed to read config secret: %w", err)
-		}
+func (srw *SecretReaderWriter) createConfigSecret(ctx context.Context, namespaceName types.NamespacedName, cfg *BrokerConfig, patch ExtensionOwnedConfig) error {
+	raw, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("write extension config failed to marshal config: %w", err)
+	}
+	err = srw.Client.Create(ctx, newConfigSecret(namespaceName, string(raw)))
+	if err == nil {
+		return nil
+	}
+	if !errors.IsAlreadyExists(err) {
+		return fmt.Errorf("write extension config failed to create config secret: %w", err)
+	}
+	secret := &corev1.Secret{}
+	if err := srw.Client.Get(ctx, namespaceName, secret); err != nil {
+		return fmt.Errorf("write extension config failed to get config secret after create: %w", err)
+	}
+	existing, err := loadBrokerConfigFromSecret(secret)
+	if err != nil {
+		return fmt.Errorf("write extension config failed to parse config: %w", err)
+	}
+	if !applyExtensionOwned(existing, patch) {
+		return nil
+	}
+	if err := storeBrokerConfig(secret, existing); err != nil {
+		return fmt.Errorf("write extension config failed to marshal config: %w", err)
+	}
+	return srw.Client.Update(ctx, secret)
+}
 
-		if globalGuardrailsEqual(existingConfig.GlobalGuardrails, guardrailsConfig) {
-			return nil
-		}
-
-		existingConfig.GlobalGuardrails = guardrailsConfig
-		updated, err := yaml.Marshal(existingConfig)
-		if err != nil {
-			return fmt.Errorf("write global guardrails failed to marshal config: %w", err)
-		}
-
-		backingSecret.StringData[configFileName] = string(updated)
-		return srw.Client.Update(ctx, backingSecret)
-	})
+// applyExtensionOwned overlays patch onto cfg. Nil patch fields are skipped.
+func applyExtensionOwned(cfg *BrokerConfig, patch ExtensionOwnedConfig) bool {
+	changed := false
+	if patch.GatewayCACertPEM != nil && cfg.GatewayCACertPEM != *patch.GatewayCACertPEM {
+		cfg.GatewayCACertPEM = *patch.GatewayCACertPEM
+		changed = true
+	}
+	if patch.GlobalGuardrails != nil && !globalGuardrailsEqual(cfg.GlobalGuardrails, patch.GlobalGuardrails.Config) {
+		cfg.GlobalGuardrails = patch.GlobalGuardrails.Config
+		changed = true
+	}
+	if patch.MaxBodyBytes != nil && cfg.MaxBodyBytes != *patch.MaxBodyBytes {
+		cfg.MaxBodyBytes = *patch.MaxBodyBytes
+		changed = true
+	}
+	return changed
 }
 
 // globalGuardrailsEqual reports whether two possibly-nil GuardrailsConfig
@@ -335,8 +390,8 @@ func (srw *SecretReaderWriter) EnsureConfigExists(ctx context.Context, namespace
 	return err
 }
 
-// WriteEmptyConfig overwrites the config secret with an empty configuration.
-// This clears all servers and virtual servers from the config.
+// WriteEmptyConfig overwrites the config secret with an empty configuration,
+// clearing servers, virtual servers, and extension-owned fields.
 // Uses a read-modify-write pattern with automatic retry on conflict errors.
 func (srw *SecretReaderWriter) WriteEmptyConfig(ctx context.Context, namespaceName types.NamespacedName) error {
 	srw.Logger.Info("SecretReaderWriter WriteEmptyConfig", "secret", namespaceName)

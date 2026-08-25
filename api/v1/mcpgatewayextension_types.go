@@ -147,6 +147,7 @@ type MCPGatewayExtensionSpec struct {
 
 	// maxBodyBytes caps the size of any body the router buffers, in bytes.
 	// Applies to request/response prefix stripping and guardrails checks.
+	// Default must match config.DefaultMaxBodyBytes (1 MiB).
 	// +optional
 	// +default=1048576
 	// +kubebuilder:validation:Minimum=1

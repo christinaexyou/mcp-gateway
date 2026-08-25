@@ -46,11 +46,8 @@ func generateTestCACertPEM(t *testing.T) []byte {
 }
 
 type capturingConfigWriter struct {
-	lastCACertPEM string
-	writeCalled   bool
-
-	lastGuardrailsConfig  *config.GuardrailsConfig
-	guardrailsWriteCalled bool
+	last   config.ExtensionOwnedConfig
+	writes int
 }
 
 func (c *capturingConfigWriter) DeleteConfig(_ context.Context, _ types.NamespacedName) error {
@@ -62,14 +59,9 @@ func (c *capturingConfigWriter) EnsureConfigExists(_ context.Context, _ types.Na
 func (c *capturingConfigWriter) WriteEmptyConfig(_ context.Context, _ types.NamespacedName) error {
 	return nil
 }
-func (c *capturingConfigWriter) WriteCACertBundle(_ context.Context, caCertPEM string, _ types.NamespacedName) error {
-	c.lastCACertPEM = caCertPEM
-	c.writeCalled = true
-	return nil
-}
-func (c *capturingConfigWriter) WriteGlobalGuardrails(_ context.Context, guardrailsConfig *config.GuardrailsConfig, _ types.NamespacedName) error {
-	c.lastGuardrailsConfig = guardrailsConfig
-	c.guardrailsWriteCalled = true
+func (c *capturingConfigWriter) WriteExtensionConfig(_ context.Context, ext config.ExtensionOwnedConfig, _ types.NamespacedName) error {
+	c.last = ext
+	c.writes++
 	return nil
 }
 
@@ -182,10 +174,8 @@ func TestReconcileCACertBundle(t *testing.T) {
 			}
 			fc := fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objs...).Build()
 
-			writer := &capturingConfigWriter{}
 			r := &MCPGatewayExtensionReconciler{
-				DirectAPIReader:     fc,
-				ConfigWriterDeleter: writer,
+				DirectAPIReader: fc,
 			}
 
 			mcpExt := &mcpv1.MCPGatewayExtension{
@@ -195,7 +185,7 @@ func TestReconcileCACertBundle(t *testing.T) {
 				},
 			}
 
-			err := r.reconcileCACertBundle(context.Background(), mcpExt)
+			gotPEM, err := r.resolveCACertBundle(context.Background(), mcpExt)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("expected error, got nil")
@@ -215,11 +205,8 @@ func TestReconcileCACertBundle(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if !writer.writeCalled {
-				t.Fatal("WriteCACertBundle was not called")
-			}
-			if writer.lastCACertPEM != tt.wantPEM {
-				t.Fatalf("unexpected PEM: got %d bytes, want %d bytes", len(writer.lastCACertPEM), len(tt.wantPEM))
+			if gotPEM != tt.wantPEM {
+				t.Fatalf("unexpected PEM: got %d bytes, want %d bytes", len(gotPEM), len(tt.wantPEM))
 			}
 		})
 	}

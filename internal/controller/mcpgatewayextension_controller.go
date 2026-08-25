@@ -102,8 +102,7 @@ type ConfigWriterDeleter interface {
 	DeleteConfig(ctx context.Context, namespaceName types.NamespacedName) error
 	EnsureConfigExists(ctx context.Context, namespaceName types.NamespacedName) error
 	WriteEmptyConfig(ctx context.Context, namespaceName types.NamespacedName) error
-	WriteCACertBundle(ctx context.Context, caCertPEM string, namespaceName types.NamespacedName) error
-	WriteGlobalGuardrails(ctx context.Context, guardrailsConfig *config.GuardrailsConfig, namespaceName types.NamespacedName) error
+	WriteExtensionConfig(ctx context.Context, ext config.ExtensionOwnedConfig, namespaceName types.NamespacedName) error
 }
 
 // MCPGatewayExtensionReconciler reconciles a MCPGatewayExtension object
@@ -215,10 +214,6 @@ func (r *MCPGatewayExtensionReconciler) reconcileActive(ctx context.Context, mcp
 		return ctrl.Result{}, err
 	}
 
-	if err := r.ConfigWriterDeleter.EnsureConfigExists(ctx, config.NamespaceName(mcpExt.Namespace)); err != nil {
-		return ctrl.Result{}, err
-	}
-
 	if err := r.reconcileTrustedHeaders(ctx, mcpExt); err != nil {
 		var valErr *validationError
 		if errors.As(err, &valErr) {
@@ -243,15 +238,7 @@ func (r *MCPGatewayExtensionReconciler) reconcileActive(ctx context.Context, mcp
 		return ctrl.Result{}, err
 	}
 
-	if err := r.reconcileCACertBundle(ctx, mcpExt); err != nil {
-		var valErr *validationError
-		if errors.As(err, &valErr) {
-			return ctrl.Result{}, r.updateStatus(ctx, mcpExt, metav1.ConditionFalse, valErr.reason, valErr.message)
-		}
-		return ctrl.Result{}, err
-	}
-
-	if err := r.reconcileGuardrails(ctx, mcpExt); err != nil {
+	if err := r.reconcileExtensionConfig(ctx, mcpExt); err != nil {
 		var valErr *validationError
 		if errors.As(err, &valErr) {
 			return ctrl.Result{}, r.updateStatus(ctx, mcpExt, metav1.ConditionFalse, valErr.reason, valErr.message)
@@ -924,41 +911,90 @@ func (r *MCPGatewayExtensionReconciler) enqueueMCPGatewayExtForEnvoyFilter(_ con
 	}}
 }
 
-// reconcileGuardrails validates the guardrails Secret referenced by the
-// labelGuardrailsReference annotation and writes the resolved config into the
-// config secret's globalGuardrails field. The annotation is optional: when
-// unset, guardrails is disabled for this gateway and any previously written
-// config is cleared.
-func (r *MCPGatewayExtensionReconciler) reconcileGuardrails(ctx context.Context, mcpExt *mcpv1.MCPGatewayExtension) error {
-	ns := config.NamespaceName(mcpExt.Namespace)
+// reconcileExtensionConfig resolves CA bundle, guardrails, and maxBodyBytes
+// then writes the fields that resolved. A validation error in one field does
+// not block the others; the error is returned after the write so status still
+// reflects the failure. A missing guardrails Secret (annotation set) clears
+// GlobalGuardrails; invalid Secret data is omitted so the last write stays.
+func (r *MCPGatewayExtensionReconciler) reconcileExtensionConfig(ctx context.Context, mcpExt *mcpv1.MCPGatewayExtension) error {
+	patch := config.ExtensionOwnedConfig{}
+	n := resolveMaxBodyBytes(mcpExt)
+	patch.MaxBodyBytes = &n
 
+	var resolveErr error
+	omitted := false
+	if pem, err := r.resolveCACertBundle(ctx, mcpExt); err != nil {
+		resolveErr = err
+		omitted = true
+	} else {
+		patch.GatewayCACertPEM = &pem
+	}
+	if gr, err := r.resolveGuardrails(ctx, mcpExt); err != nil {
+		if resolveErr == nil {
+			resolveErr = err
+		}
+		var valErr *validationError
+		if errors.As(err, &valErr) && valErr.reason == mcpv1.GuardrailsSecretNotFound {
+			// annotation set, secret gone: clear so the data plane does not
+			// keep enforcing stale rails. invalid YAML / API errors omit
+			// instead and keep the last written config.
+			patch.GlobalGuardrails = &config.GuardrailsUpdate{Config: nil}
+		} else {
+			omitted = true
+		}
+	} else {
+		patch.GlobalGuardrails = &config.GuardrailsUpdate{Config: gr}
+	}
+
+	if err := r.ConfigWriterDeleter.WriteExtensionConfig(ctx, patch, config.NamespaceName(mcpExt.Namespace)); err != nil {
+		return err
+	}
+	if omitted && r.log != nil {
+		r.log.Info("keeping last written CA/guardrails for fields that failed to resolve", "error", resolveErr)
+	}
+	return resolveErr
+}
+
+func resolveMaxBodyBytes(mcpExt *mcpv1.MCPGatewayExtension) int64 {
+	if mcpExt.Spec.MaxBodyBytes != nil {
+		return int64(*mcpExt.Spec.MaxBodyBytes)
+	}
+	return config.DefaultMaxBodyBytes
+}
+
+// resolveGuardrails validates the guardrails Secret referenced by the
+// labelGuardrailsReference annotation. The annotation is optional: when unset,
+// guardrails is disabled for this gateway and the writer clears any previously
+// written config. NotFound is a validation error; reconcileExtensionConfig
+// clears the written config. Invalid Secret data is also a validation error
+// but is omitted from the patch so the last good config remains.
+func (r *MCPGatewayExtensionReconciler) resolveGuardrails(ctx context.Context, mcpExt *mcpv1.MCPGatewayExtension) (*config.GuardrailsConfig, error) {
 	guardrailsSecretRef := mcpExt.Annotations[labelGuardrailsReference]
 	if guardrailsSecretRef == "" {
-		return r.ConfigWriterDeleter.WriteGlobalGuardrails(ctx, nil, ns)
+		return nil, nil
 	}
 
 	secret := &corev1.Secret{}
-	if err := r.Get(ctx, client.ObjectKey{Name: guardrailsSecretRef, Namespace: mcpExt.Namespace}, secret); err != nil {
+	if err := r.DirectAPIReader.Get(ctx, client.ObjectKey{Name: guardrailsSecretRef, Namespace: mcpExt.Namespace}, secret); err != nil {
 		if apierrors.IsNotFound(err) {
-			return newValidationError(mcpv1.GuardrailsSecretNotFound,
+			return nil, newValidationError(mcpv1.GuardrailsSecretNotFound,
 				fmt.Sprintf("guardrails secret %s not found", guardrailsSecretRef))
 		}
-		return fmt.Errorf("failed to get guardrails secret: %w", err)
+		return nil, fmt.Errorf("failed to get guardrails secret: %w", err)
 	}
 
-	// Check if the secret has the required label
 	if secret.Labels == nil || secret.Labels[ManagedSecretLabel] != ManagedSecretValue {
-		return newValidationError(mcpv1.ConditionReasonSecretInvalid,
+		return nil, newValidationError(mcpv1.ConditionReasonSecretInvalid,
 			fmt.Sprintf("guardrails secret %s missing required label %s=%s", guardrailsSecretRef, ManagedSecretLabel, ManagedSecretValue))
 	}
 
 	guardrailsConfig, err := guardrails.EnsureNeMoConfigData(secret.Type, secret.Data)
 	if err != nil {
-		return newValidationError(mcpv1.ConditionReasonSecretInvalid,
+		return nil, newValidationError(mcpv1.ConditionReasonSecretInvalid,
 			fmt.Sprintf("guardrails secret %s is invalid: %v", guardrailsSecretRef, err))
 	}
 
-	return r.ConfigWriterDeleter.WriteGlobalGuardrails(ctx, guardrailsConfig, ns)
+	return guardrailsConfig, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
