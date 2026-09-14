@@ -107,6 +107,12 @@ spec:
     name: my-server-ca
 ```
 
+## Annotations
+
+| **Annotation** | **Description** |
+|----------------|-----------------|
+| `mcp.kuadrant.io/guardrails-config-ids` | Comma-separated list of NeMo Guardrails config IDs applied to this server in addition to the global `configIDs` set in the gateway guardrails Secret. Requires `mcp.kuadrant.io/guardrails-ref` on the MCPGatewayExtension — without it, the server is set to `NotReady` with reason `GatewayGuardrailsNotConfigured`. Per-server IDs are additive and cannot remove global policies |
+
 ## MCPServerRegistrationStatus
 
 | **Field** | **Type** | **Description** |

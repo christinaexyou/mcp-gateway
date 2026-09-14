@@ -32,6 +32,7 @@
 | `urlElicitation` | String | No | Controls URL-based token elicitation. `Enabled`: creates a separate `/tokens` HTTPRoute and passes `--enable-url-elicitation` to the broker. `Disabled` (default): no `/tokens` route is created |
 | `caCertBundleRef` | [CACertBundleReference](#cacertbundlereference) | No | References a Secret containing a PEM-encoded CA certificate bundle. Used as the base trust pool for broker connections to all upstream MCP servers, and for 2025-11-25 protocol hairpin requests to the gateway HTTPS listener. 2026-07-28 MCP calls do not hairpin. Per-server `caCertSecretRef` on MCPServerRegistration appends to this pool for upstreams. If the gateway listener CA differs from upstream CAs, include both PEMs in the Secret. The Secret must have the label `mcp.kuadrant.io/secret: "true"` and must not exceed 256 KiB |
 | `oauthProtectedResource` | [OAuthProtectedResource](#oauthprotectedresource) | No | Configures the OAuth protected resource metadata served at `/.well-known/oauth-protected-resource`. When set, the controller injects `OAUTH_*` env vars into the broker-router deployment |
+| `maxBodyBytes` | Integer | No | Maximum bytes the router buffers for streamed body accumulation (request or response). Applies to guardrails inspection and any other per-request body processing. Default: 1048576 (1 MiB). Bodies exceeding this limit are rejected with 413 regardless of `failMode`. For `2025-11-25` clients, Envoy's `per_connection_buffer_limit_bytes` must be >= this value |
 
 
 ## MCPGatewayExtensionTargetReference
@@ -78,6 +79,12 @@ Trust pool hierarchy: system roots, then gateway CA bundle (if set), then per-se
 | `bearerMethodsSupported` | []String | No | Supported bearer token methods. Defaults to `["header"]`. Injected as `OAUTH_BEARER_METHODS_SUPPORTED` (comma-separated) |
 | `scopesSupported` | []String | No | Supported OAuth scopes. Defaults to `["basic"]`. Injected as `OAUTH_SCOPES_SUPPORTED` (comma-separated) |
 
+## Annotations
+
+| **Annotation** | **Description** |
+|----------------|-----------------|
+| `mcp.kuadrant.io/guardrails-ref` | Name of a Secret in the same namespace containing NeMo Guardrails configuration. Secret type must be `guardrails/external/nemo` with label `mcp.kuadrant.io/secret: "true"` and a `config.yaml` key containing `url`, `model`, `configIDs`, and `failMode`. Validated at reconcile time, not admission. See [NeMo Guardrails guide](../guides/nemo-guardrails.md) |
+
 ## MCPGatewayExtensionStatus
 
 | **Field** | **Type** | **Description** |
@@ -89,6 +96,7 @@ Trust pool hierarchy: system roots, then gateway CA bundle (if set), then per-se
 | **Type** | **Description** |
 |----------|-----------------|
 | `Ready` | Indicates whether the MCPGatewayExtension is fully configured: the broker-router deployment is running, the EnvoyFilter has been applied, and trusted headers (if configured) are valid |
+| `GuardrailsSecretNotFound` | Set when the Secret referenced by `mcp.kuadrant.io/guardrails-ref` does not exist or is missing required fields. All MCPServerRegistrations are set to `NotReady` until the Secret is restored or the annotation is removed |
 
 ### Condition Reasons
 
