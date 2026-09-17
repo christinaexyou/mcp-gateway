@@ -15,6 +15,7 @@ import (
 
 	"github.com/Kuadrant/mcp-gateway/internal/config"
 	api "github.com/Kuadrant/mcp-gateway/internal/guardrails/api"
+	"github.com/Kuadrant/mcp-gateway/internal/protocol"
 	"github.com/Kuadrant/mcp-gateway/internal/routing"
 	"github.com/Kuadrant/mcp-gateway/internal/session"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -430,6 +431,43 @@ func requestHeadersStep() mockProcessServerMessageAndErr {
 					Headers: &corev3.HeaderMap{
 						Headers: []*corev3.HeaderValue{
 							{Key: "content-type", RawValue: []byte("application/json")},
+						},
+					},
+				},
+			},
+		},
+		resp: []*extProcV3.ProcessingResponse{
+			{
+				Response: &extProcV3.ProcessingResponse_RequestHeaders{
+					RequestHeaders: &extProcV3.HeadersResponse{
+						Response: &extProcV3.CommonResponse{
+							HeaderMutation: &extProcV3.HeaderMutation{
+								SetHeaders: []*corev3.HeaderValueOption{
+									{Header: &corev3.HeaderValue{Key: ":authority"}},
+								},
+								RemoveHeaders: []string{"x-mcp-authorized", "x-mcp-virtualserver", "x-mcp-verified-sub"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// requestHeadersStep202607 returns a request headers step for the
+// 2026-07-28 header-based routing protocol.
+func requestHeadersStep202607(toolName string) mockProcessServerMessageAndErr {
+	return mockProcessServerMessageAndErr{
+		msg: &extProcV3.ProcessingRequest{
+			Request: &extProcV3.ProcessingRequest_RequestHeaders{
+				RequestHeaders: &extProcV3.HttpHeaders{
+					Headers: &corev3.HeaderMap{
+						Headers: []*corev3.HeaderValue{
+							{Key: "content-type", RawValue: []byte("application/json")},
+							{Key: "mcp-protocol-version", RawValue: []byte(protocol.Version2026)},
+							{Key: "mcp-method", RawValue: []byte(routing.MethodToolCall)},
+							{Key: "mcp-name", RawValue: []byte(toolName)},
 						},
 					},
 				},
@@ -1048,37 +1086,10 @@ func TestProcess_ToolCallAuditLog_RouterError(t *testing.T) {
 	require.Empty(t, found.attrs["session"])
 }
 
-// TestProcess_GuardrailsAllowed_BodyPassthrough verifies that when guardrails
-// allow a tools/call response (nil replacement), the body passes through to
-// the client and any downstream rewriters (resourceURIRewriter) still run.
-// This guards the composition branch where replacement==nil and rewriter/resourceRewriter
-// must NOT be nilled out.
-func TestProcess_GuardrailsAllowed_BodyPassthrough(t *testing.T) {
-	cache, err := session.NewCache()
-	require.NoError(t, err)
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-
-	// config with an ALLOWED guardrails checker
-	cfg := &config.MCPServersConfig{}
-	cfg.ApplyReload([]*config.MCPServer{{
-		Name:                "s1",
-		GuardrailsConfigIDs: []string{"cfg-1"},
-	}}, nil, "", 0, nil, &allowAllChecker{})
-
-	srv := &ExtProcServer{
-		Logger:          logger,
-		SessionCache:    cache,
-		Router:          &stubRouterGuardrails{configIDs: []string{"cfg-1"}, serverPrefix: "s1_"},
-		ResponseHandler: &bufferedResponseHandler{},
-	}
-	srv.RoutingConfig.Store(cfg)
-
-	toolCallBody := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"s1_echo","arguments":{}}}`)
-	// a plain JSON-RPC tool result with text content — no resource URIs so resourceRewriter is a no-op
-	toolResultBody := []byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello world"}]}}`)
-
-	mock := makeMockProcessServer(t, []mockProcessServerMessageAndErr{
-		requestHeadersStep(),
+// guardrailsBufferedResponseSteps returns the shared RequestBody →
+// ResponseHeaders → ResponseBody mock steps for guardrails allow/block tests.
+func guardrailsBufferedResponseSteps(toolCallBody, toolResultBody, wantBody []byte) []mockProcessServerMessageAndErr {
+	return []mockProcessServerMessageAndErr{
 		{
 			msg: &extProcV3.ProcessingRequest{
 				Request: &extProcV3.ProcessingRequest_RequestBody{
@@ -1121,8 +1132,6 @@ func TestProcess_GuardrailsAllowed_BodyPassthrough(t *testing.T) {
 			},
 		},
 		// response body arrives in one shot (BUFFERED mode, endOfStream=true).
-		// guardrails ALLOW → body returned unchanged. resourceRewriter runs but
-		// finds no resource URIs so body is identical.
 		{
 			msg: &extProcV3.ProcessingRequest{
 				Request: &extProcV3.ProcessingRequest_ResponseBody{
@@ -1139,7 +1148,7 @@ func TestProcess_GuardrailsAllowed_BodyPassthrough(t *testing.T) {
 							Response: &extProcV3.CommonResponse{
 								BodyMutation: &extProcV3.BodyMutation{
 									Mutation: &extProcV3.BodyMutation_Body{
-										Body: toolResultBody,
+										Body: wantBody,
 									},
 								},
 							},
@@ -1148,7 +1157,41 @@ func TestProcess_GuardrailsAllowed_BodyPassthrough(t *testing.T) {
 				},
 			},
 		},
-	})
+	}
+}
+
+// TestProcess_GuardrailsAllowed_BodyPassthrough verifies that when guardrails
+// allow a tools/call response (nil replacement), the body passes through to
+// the client and any downstream rewriters (resourceURIRewriter) still run.
+// This guards the composition branch where replacement==nil and rewriter/resourceRewriter
+// must NOT be nilled out.
+func TestProcess_GuardrailsAllowed_BodyPassthrough(t *testing.T) {
+	cache, err := session.NewCache()
+	require.NoError(t, err)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	// config with an ALLOWED guardrails checker
+	cfg := &config.MCPServersConfig{}
+	cfg.ApplyReload([]*config.MCPServer{{
+		Name:                "s1",
+		GuardrailsConfigIDs: []string{"cfg-1"},
+	}}, nil, "", 0, nil, &allowAllChecker{})
+
+	srv := &ExtProcServer{
+		Logger:          logger,
+		SessionCache:    cache,
+		Router:          &stubRouterGuardrails{configIDs: []string{"cfg-1"}, serverPrefix: "s1_"},
+		ResponseHandler: &bufferedResponseHandler{},
+	}
+	srv.RoutingConfig.Store(cfg)
+
+	toolCallBody := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"s1_echo","arguments":{}}}`)
+	// a plain JSON-RPC tool result with text content — no resource URIs so resourceRewriter is a no-op
+	toolResultBody := []byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello world"}]}}`)
+
+	steps := append([]mockProcessServerMessageAndErr{requestHeadersStep()},
+		guardrailsBufferedResponseSteps(toolCallBody, toolResultBody, toolResultBody)...)
+	mock := makeMockProcessServer(t, steps)
 
 	err = srv.Process(mock)
 	require.NoError(t, err)
@@ -1183,74 +1226,80 @@ func TestProcess_GuardrailsBlocked_ReplacementBody(t *testing.T) {
 	// blockAllChecker blocks every response; adapter must send this replacement.
 	blockedBody := []byte(routing.BuildSSEToolError(1, "blocked by guardrails"))
 
-	mock := makeMockProcessServer(t, []mockProcessServerMessageAndErr{
-		requestHeadersStep(),
-		{
-			msg: &extProcV3.ProcessingRequest{
-				Request: &extProcV3.ProcessingRequest_RequestBody{
-					RequestBody: &extProcV3.HttpBody{
-						Body:        toolCallBody,
-						EndOfStream: true,
-					},
-				},
-			},
-			resp: []*extProcV3.ProcessingResponse{
-				{
-					Response: &extProcV3.ProcessingResponse_RequestBody{
-						RequestBody: &extProcV3.BodyResponse{
-							Response: &extProcV3.CommonResponse{
-								HeaderMutation: &extProcV3.HeaderMutation{},
-							},
-						},
-					},
-				},
-			},
-		},
-		{
-			msg: &extProcV3.ProcessingRequest{
-				Request: &extProcV3.ProcessingRequest_ResponseHeaders{
-					ResponseHeaders: &extProcV3.HttpHeaders{
-						Headers: &corev3.HeaderMap{
-							Headers: []*corev3.HeaderValue{
-								{Key: ":status", Value: "200"},
-							},
-						},
-					},
-				},
-			},
-			resp: []*extProcV3.ProcessingResponse{
-				{
-					Response:     &extProcV3.ProcessingResponse_ResponseHeaders{ResponseHeaders: &extProcV3.HeadersResponse{}},
-					ModeOverride: bufferedModeOverride,
-				},
-			},
-		},
-		{
-			msg: &extProcV3.ProcessingRequest{
-				Request: &extProcV3.ProcessingRequest_ResponseBody{
-					ResponseBody: &extProcV3.HttpBody{
-						Body:        toolResultBody,
-						EndOfStream: true,
-					},
-				},
-			},
-			resp: []*extProcV3.ProcessingResponse{
-				{
-					Response: &extProcV3.ProcessingResponse_ResponseBody{
-						ResponseBody: &extProcV3.BodyResponse{
-							Response: &extProcV3.CommonResponse{
-								BodyMutation: &extProcV3.BodyMutation{
-									Mutation: &extProcV3.BodyMutation_Body{
-										Body: blockedBody,
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	})
+	steps := append([]mockProcessServerMessageAndErr{requestHeadersStep()},
+		guardrailsBufferedResponseSteps(toolCallBody, toolResultBody, blockedBody)...)
+	mock := makeMockProcessServer(t, steps)
+
+	err = srv.Process(mock)
+	require.NoError(t, err)
+	mock.verifyAllResponsesConsumed()
+}
+
+// TestProcess202607_GuardrailsAllowed_BodyPassthrough mirrors
+// TestProcess_GuardrailsAllowed_BodyPassthrough for the 2026-07-28 protocol.
+func TestProcess202607_GuardrailsAllowed_BodyPassthrough(t *testing.T) {
+	cache, err := session.NewCache()
+	require.NoError(t, err)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	cfg := &config.MCPServersConfig{}
+	cfg.ApplyReload([]*config.MCPServer{{
+		Name:                "s1",
+		GuardrailsConfigIDs: []string{"cfg-1"},
+	}}, nil, "", 0, nil, &allowAllChecker{})
+
+	srv := &ExtProcServer{
+		Logger:              logger,
+		SessionCache:        cache,
+		Router202607:        &stubRouterGuardrails{configIDs: []string{"cfg-1"}},
+		ResponseHandler2026: &bufferedResponseHandler{},
+	}
+	srv.RoutingConfig.Store(cfg)
+
+	toolCallBody := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"s1_echo","arguments":{}}}`)
+	// a plain JSON-RPC tool result with text content
+	toolResultBody := []byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"hello world"}]}}`)
+
+	steps := append([]mockProcessServerMessageAndErr{requestHeadersStep202607("s1_echo")},
+		guardrailsBufferedResponseSteps(toolCallBody, toolResultBody, toolResultBody)...)
+	mock := makeMockProcessServer(t, steps)
+
+	err = srv.Process(mock)
+	require.NoError(t, err)
+	mock.verifyAllResponsesConsumed()
+}
+
+// TestProcess202607_GuardrailsBlocked_ReplacementBody mirrors
+// TestProcess_GuardrailsBlocked_ReplacementBody for the 2026-07-28 protocol:
+// the replacement is plain JSON, not an SSE event.
+func TestProcess202607_GuardrailsBlocked_ReplacementBody(t *testing.T) {
+	cache, err := session.NewCache()
+	require.NoError(t, err)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	cfg := &config.MCPServersConfig{}
+	cfg.ApplyReload([]*config.MCPServer{{
+		Name:                "s1",
+		GuardrailsConfigIDs: []string{"cfg-1"},
+	}}, nil, "", 0, nil, &blockAllChecker{})
+
+	srv := &ExtProcServer{
+		Logger:              logger,
+		SessionCache:        cache,
+		Router202607:        &stubRouterGuardrails{configIDs: []string{"cfg-1"}},
+		ResponseHandler2026: &bufferedResponseHandler{},
+	}
+	srv.RoutingConfig.Store(cfg)
+
+	toolCallBody := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"s1_echo","arguments":{}}}`)
+	toolResultBody := []byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"secret data"}]}}`)
+	// blockAllChecker blocks every response; adapter must send this replacement,
+	// framed as plain JSON (not an SSE event) for the 2026-07-28 protocol.
+	blockedBody := []byte(routing.BuildJSONToolError(1, "blocked by guardrails"))
+
+	steps := append([]mockProcessServerMessageAndErr{requestHeadersStep202607("s1_echo")},
+		guardrailsBufferedResponseSteps(toolCallBody, toolResultBody, blockedBody)...)
+	mock := makeMockProcessServer(t, steps)
 
 	err = srv.Process(mock)
 	require.NoError(t, err)
