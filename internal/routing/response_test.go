@@ -815,3 +815,105 @@ func TestResponseHandler_StreamBodyWithPrefixNoGuardrailsDoesNotBuffer(t *testin
 	require.True(t, decision.StreamBody, "prefix still requires streaming for resource URI rewriting")
 	require.False(t, decision.BufferResponseBody, "no guardrails means no buffering")
 }
+
+func TestResponseHandler202607_BufferResponseBodyForGuardrails(t *testing.T) {
+	handler := &ResponseHandler202607{
+		Logger: slog.New(slog.NewTextHandler(os.Stdout, nil)),
+	}
+
+	mcpReq := &MCPRequest{
+		Method:              "tools/call",
+		GuardrailsConfigIDs: []string{"svr-1"},
+	}
+
+	input := &ResponseInput{
+		StatusCode: "200",
+		Request:    mcpReq,
+	}
+
+	decision := handler.HandleResponse(context.Background(), input)
+	require.NotNil(t, decision)
+	require.True(t, decision.StreamBody, "StreamBody must be true for guardrails")
+	require.True(t, decision.BufferResponseBody, "BufferResponseBody must be true for guardrails")
+}
+
+func TestResponseHandler202607_BufferResponseBodyNotSetForNon200(t *testing.T) {
+	handler := &ResponseHandler202607{
+		Logger: slog.New(slog.NewTextHandler(os.Stdout, nil)),
+	}
+
+	mcpReq := &MCPRequest{
+		Method:              "tools/call",
+		GuardrailsConfigIDs: []string{"svr-1"},
+	}
+
+	for _, status := range []string{"404", "500", "401"} {
+		t.Run("status_"+status, func(t *testing.T) {
+			input := &ResponseInput{
+				StatusCode: status,
+				Request:    mcpReq,
+			}
+			decision := handler.HandleResponse(context.Background(), input)
+			require.NotNil(t, decision)
+			require.False(t, decision.StreamBody)
+			require.False(t, decision.BufferResponseBody)
+		})
+	}
+}
+
+func TestResponseHandler202607_BufferResponseBodyNotSetWithoutGuardrails(t *testing.T) {
+	handler := &ResponseHandler202607{
+		Logger: slog.New(slog.NewTextHandler(os.Stdout, nil)),
+	}
+
+	mcpReq := &MCPRequest{
+		Method: "tools/call",
+		// no GuardrailsConfigIDs
+	}
+
+	input := &ResponseInput{
+		StatusCode: "200",
+		Request:    mcpReq,
+	}
+
+	decision := handler.HandleResponse(context.Background(), input)
+	require.NotNil(t, decision)
+	require.False(t, decision.StreamBody)
+	require.False(t, decision.BufferResponseBody)
+}
+
+func TestResponseHandler202607_BufferResponseBodyNotSetForNonToolCall(t *testing.T) {
+	handler := &ResponseHandler202607{
+		Logger: slog.New(slog.NewTextHandler(os.Stdout, nil)),
+	}
+
+	mcpReq := &MCPRequest{
+		Method:              "tools/list",
+		GuardrailsConfigIDs: []string{"svr-1"},
+	}
+
+	input := &ResponseInput{
+		StatusCode: "200",
+		Request:    mcpReq,
+	}
+
+	decision := handler.HandleResponse(context.Background(), input)
+	require.NotNil(t, decision)
+	require.False(t, decision.StreamBody)
+	require.False(t, decision.BufferResponseBody)
+}
+
+func TestResponseHandler202607_NilRequestPassesThrough(t *testing.T) {
+	handler := &ResponseHandler202607{
+		Logger: slog.New(slog.NewTextHandler(os.Stdout, nil)),
+	}
+
+	input := &ResponseInput{
+		StatusCode: "200",
+	}
+
+	decision := handler.HandleResponse(context.Background(), input)
+	require.NotNil(t, decision)
+	require.False(t, decision.StreamBody)
+	require.False(t, decision.BufferResponseBody)
+}

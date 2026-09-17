@@ -600,6 +600,11 @@ func (s *ExtProcServer) Process(stream extProcV3.ExternalProcessor_ProcessServer
 			// running any rewriters so a block replaces the entire response.
 			if guardrailsActive {
 				text := extractToolResponseText(body)
+				sse := protocolVersion != protocol.Version2026
+				buildError, buildResult := routing.BuildSSEToolError, routing.BuildSSEToolResult
+				if !sse {
+					buildError, buildResult = routing.BuildJSONToolError, routing.BuildJSONToolResult
+				}
 				replacement := routing.CheckToolResponseGuardrails(
 					ctx,
 					s.RoutingConfig.Load(),
@@ -608,8 +613,9 @@ func (s *ExtProcServer) Process(stream extProcV3.ExternalProcessor_ProcessServer
 					text,
 					mcpRequest.ID,
 					s.Logger,
-					routing.BuildSSEToolError,
-					routing.BuildSSEToolResult,
+					sse,
+					buildError,
+					buildResult,
 				)
 				if replacement != nil {
 					body = replacement

@@ -109,6 +109,11 @@ func (r *Router202607) routeToolCall(ctx context.Context, table RoutingTable, re
 	}
 	serverInfo := routeToMCPServer(route)
 
+	// stamp config IDs for the response-phase guardrails check
+	if req.Parsed != nil {
+		req.Parsed.GuardrailsConfigIDs = route.GuardrailsConfigIDs
+	}
+
 	span.SetAttributes(
 		attribute.String("mcp.server", serverInfo.Name),
 		attribute.String("mcp.server.hostname", serverInfo.Hostname),

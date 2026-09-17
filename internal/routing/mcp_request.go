@@ -319,6 +319,23 @@ func BuildJSONToolError(requestID any, message string) string {
 	return b.String()
 }
 
+// BuildJSONToolResult constructs a successful plain JSON-RPC tool result for
+// 2026-07-28, used when guardrails redacts response content.
+func BuildJSONToolResult(requestID any, text string) string {
+	var b strings.Builder
+	b.WriteString("{\"jsonrpc\":\"2.0\",\"id\":")
+	idBytes, err := json.Marshal(requestID)
+	if err != nil {
+		b.WriteString("null")
+	} else {
+		b.Write(idBytes)
+	}
+	b.WriteString(",\"result\":{\"content\":[{\"type\":\"text\",\"text\":")
+	b.WriteString(jsonQuote(text))
+	b.WriteString("}]}}")
+	return b.String()
+}
+
 func jsonQuote(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
